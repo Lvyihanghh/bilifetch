@@ -10,7 +10,7 @@
 
 cask "bilifetch" do
   version "1.0.0"
-  sha256 "6c9027249e615297f25ffdb564b5797ef91c4bcaba28f8c0b3a35506f5b99bad"
+  sha256 "7cd272934e40b7425f0cc1b294a142a0ca4042f09db44459273e076a52fd9888"
 
   url "https://github.com/Lvyihanghh/bilifetch/releases/download/v#{version}/BiliFetch-#{version}-macOS.dmg"
   name "BiliFetch"

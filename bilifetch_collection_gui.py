@@ -64,7 +64,7 @@ class ItemRow(QWidget):
         lay.setSpacing(12)
 
         self.check = QCheckBox()
-        self.check.setChecked(True)
+        self.check.setChecked(item.get("checked", True))
         self.check.setCursor(Qt.PointingHandCursor)
         lay.addWidget(self.check, 0, Qt.AlignTop)
 
@@ -79,9 +79,17 @@ class ItemRow(QWidget):
         self.title = QLabel(item.get("title") or item.get("bvid"))
         self.title.setWordWrap(True)
         self.title.setStyleSheet("color:#22252B; font-size:13px;")
-        meta = "%s · %s 播放" % (col.format_duration(item.get("duration")),
-                                 col.format_views(item.get("view")))
-        self.meta = QLabel(meta + "   " + item.get("bvid"))
+        group = item.get("group") or ""
+        bits = []
+        if item.get("no"):
+            bits.append("第%s集" % item["no"])
+        bits.append(col.format_duration(item.get("duration")))
+        if item.get("view"):
+            bits.append("%s 播放" % col.format_views(item.get("view")))
+        if group and group != "正片":
+            bits.append(group)
+        bits.append(item.get("bvid") or "")
+        self.meta = QLabel(" · ".join(bits))
         self.meta.setStyleSheet("color:#9AA2B2; font-size:11px;")
         box.addWidget(self.title)
         box.addWidget(self.meta)
@@ -169,6 +177,10 @@ class CollectionDialog(QDialog):
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(self._filter)
         tools.addWidget(self.search, 1)
+        self.chk_extra = QCheckBox("含花絮/二创")
+        self.chk_extra.setToolTip("番剧除了正片还有 PV、花絮、二创解析等分区")
+        self.chk_extra.toggled.connect(self._toggle_extra)
+        tools.addWidget(self.chk_extra)
         for text, slot in (("全选", self._select_all), ("全不选", self._select_none),
                            ("反选", self._invert)):
             b = QPushButton(text)
@@ -195,6 +207,8 @@ class CollectionDialog(QDialog):
             self.list.addItem(itw)
             self.list.setItemWidget(itw, row)
             self.rows.append(row)
+            if it.get("extra"):
+                self.list.setRowHidden(i, True)     # 花絮默认折叠
         root.addWidget(self.list, 1)
 
         # ---- 底部 ----
@@ -266,6 +280,8 @@ class CollectionDialog(QDialog):
             self.list.addItem(itw)
             self.list.setItemWidget(itw, row)
             self.rows.append(row)
+            if it.get("extra"):
+                self.list.setRowHidden(i, True)
         for row in self.rows:
             row.check.stateChanged.connect(self._update_count)
         self._update_count()
@@ -298,6 +314,16 @@ class CollectionDialog(QDialog):
             self.rows[idx].set_cover(img)
 
     # ---------- 选择 ----------
+    def _toggle_extra(self, on):
+        """花絮/二创分区默认折叠，勾上才显示。"""
+        for i, row in enumerate(self.rows):
+            if row.item.get("extra"):
+                self.list.setRowHidden(i, not on)
+        self._update_count()
+
+    def _extra_count(self):
+        return sum(1 for r in self.rows if r.item.get("extra"))
+
     def _visible_rows(self):
         kw = self.search.text().strip().lower()
         out = []
@@ -313,27 +339,36 @@ class CollectionDialog(QDialog):
         self._update_count()
 
     def _select_all(self):
-        """全选：作用于全部条目（不是只当前可见的），避免搜索后误以为只选了几条。"""
-        for row in self.rows:
-            row.check.setChecked(True)
+        """全选：作用于当前可见的条目（花絮折叠时不勾它）。"""
+        for i, row in enumerate(self.rows):
+            if not self.list.isRowHidden(i):
+                row.check.setChecked(True)
 
     def _select_none(self):
-        for row in self.rows:
-            row.check.setChecked(False)
+        for i, row in enumerate(self.rows):
+            if not self.list.isRowHidden(i):
+                row.check.setChecked(False)
 
     def _invert(self):
-        for row in self.rows:
-            row.check.setChecked(not row.check.isChecked())
+        for i, row in enumerate(self.rows):
+            if not self.list.isRowHidden(i):
+                row.check.setChecked(not row.check.isChecked())
 
     def _update_count(self):
-        n = sum(1 for r in self.rows if r.check.isChecked())
-        self.counter.setText("已选 %d / %d 个" % (n, len(self.rows)))
+        vis = [i for i in range(len(self.rows)) if not self.list.isRowHidden(i)]
+        n = sum(1 for i in vis if self.rows[i].check.isChecked())
+        extra = self._extra_count()
+        txt = "已选 %d / %d 个" % (n, len(vis))
+        if extra and not self.chk_extra.isChecked():
+            txt += "（另有 %d 个花絮未显示）" % extra
+        self.counter.setText(txt)
         self.ok.setText("确认下载 %d 个" % n if n else "请先选择")
         self.ok.setEnabled(n > 0)
 
     # ---------- 结果 ----------
     def selected_items(self):
-        return [r.item for r in self.rows if r.check.isChecked()]
+        return [r.item for i, r in enumerate(self.rows)
+                if r.check.isChecked() and not self.list.isRowHidden(i)]
 
     def _stop_threads(self):
         for name in ("_cover_thread", "_thumb_thread"):

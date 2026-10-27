@@ -223,10 +223,18 @@ class BiliClient:
         view = self.get_json(API + "/x/web-interface/view", {"bvid": target["bvid"]})["data"]
         info = self._pack(view, prefer_cid=target.get("cid"))
         info["season_title"] = season.get("season_title") or ""
+        # episodes 里同一集会出现两次（短版切片 + 正片），按集号分组留最长的那条
+        best = {}
+        for ep in episodes:
+            key = ep.get("title") or str(ep.get("id"))
+            old = best.get(key)
+            if old is None or (ep.get("duration") or 0) > (old.get("duration") or 0):
+                best[key] = ep
         info["episodes"] = [{"cid": ep.get("cid"), "bvid": ep.get("bvid"),
                              "title": ep.get("title") or "",
                              "long_title": ep.get("long_title") or "",
-                             "ep_id": ep.get("id")} for ep in episodes]
+                             "duration": int(ep.get("duration") or 0) // 1000,  # 毫秒->秒
+                             "ep_id": ep.get("id")} for ep in best.values()]
         return info
 
     def _pack(self, view, prefer_cid):
@@ -726,12 +734,16 @@ def main():
         if not info or not info.get("items"):
             log("这个%s里没有可下载的视频" % info.get("kind_label", "合集"))
             return 1
-        log("  %s：%s（%d 个视频）" % (info["kind_label"], info["title"], len(info["items"])))
-        for i, it in enumerate(info["items"], 1):
+        main_items = [it for it in info["items"] if not it.get("extra")]
+        extra = [it for it in info["items"] if it.get("extra")]
+        log("  %s：%s（%d 集）" % (info["kind_label"], info["title"], len(main_items)))
+        for i, it in enumerate(main_items, 1):
             log("   %3d. %s %8s  %s" % (i,
                      collection_mod.pad_display(it["title"][:40], 56),
                      collection_mod.format_duration(it["duration"]),
                      collection_mod.format_views(it["view"]) + " 播放"))
+        if extra:
+            log("   另有 %d 个花絮/二创分区（图形界面里可展开）" % len(extra))
         log("")
         log("这是%s，命令行只能整份下载。" % info["kind_label"])
         log("想挑着下，请用图形界面：BiliFetch.app（macOS）或 bilifetch-gui（Linux）。")

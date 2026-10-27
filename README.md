@@ -144,6 +144,24 @@ python3 bilifetch_gui.py        # 图形界面
 | UP 主视频列表 | `space.bilibili.com/{mid}/lists/{sid}?type=series` |
 | 老格式合集 | `space.bilibili.com/{mid}/channel/seriesdetail?sid={sid}` |
 | 收藏夹 | `space.bilibili.com/{mid}/favlist?fid={fid}` |
+| **番剧某一集** | `bilibili.com/bangumi/play/ep1633643`（会列出整季） |
+| 番剧整季 | `bilibili.com/bangumi/play/ss46585` |
+
+### 番剧的坑（查过接口才敢这么写）
+
+`pgc/view/web/season` 返回的 `episodes` 数组里**同一集会出现两次**：
+
+```
+#1   id=1633643  第1集  2458 秒   ← 正片
+#2-12 id=17266xx 第2-12集  35~107 秒 ← 短版切片
+#13-23 id=16336xx 第2-12集 1805~3030 秒 ← 真正的正片
+```
+
+官方 `total` 字段给的是去重后的集数（12），但**直接取前 total 条会全取到短版切片**。
+所以按**集号分组、每组取时长最长的那条**。另外番剧的 `duration` 单位是**毫秒**（view 接口才是秒）。
+
+除了正片，`section[]` 里还有 PV花絮 / 高能速看 / UP主看灵笼 这类分区，
+默认折叠，勾「含花絮/二创」才显示。
 
 命令行遇到合集链接会把清单列出来，并提示用图形界面挑着下。
 
