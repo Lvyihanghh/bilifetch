@@ -10,12 +10,16 @@ import sys
 from PyQt5.QtCore import QSize, Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QFont, QImage, QPainter, QPixmap
 from PyQt5.QtWidgets import (QCheckBox, QDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
-                             QListWidget, QListWidgetItem, QPushButton, QScrollArea,
+                             QListWidget, QListWidgetItem, QMessageBox, QPushButton,
                              QSizePolicy, QVBoxLayout, QWidget)
 
+import bilifetch as core
 import bilifetch_collection as col
 
 THUMB_W, THUMB_H = 96, 54
+
+# 读取合集用的客户端，由主窗口在打开对话框前设置（这样能用上 Cookie / 代理）
+collection_client = None
 
 
 class CoverThread(QThread):
@@ -93,19 +97,36 @@ class ItemRow(QWidget):
 
 
 class CollectionDialog(QDialog):
-    """合集预览窗口：列出所有视频，勾选后下载。"""
+    """浏览 / 预览窗口：贴链接 -> 读出清单 -> 勾选 -> 确认下载。
 
-    def __init__(self, info, parent=None):
+    合集/列表/收藏夹会列出全部视频；单个视频会列出它的各个分 P。
+    """
+
+    def __init__(self, info=None, url="", parent=None):
         super().__init__(parent)
-        self.info = info
+        self.info = info or {}
         self.rows = []
-        self.setWindowTitle("BiliFetch · 选择要下载的视频")
+        self.setWindowTitle("BiliFetch · 浏览")
         self.setMinimumSize(760, 620)
-        self.resize(820, 700)
+        self.resize(840, 720)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(20, 18, 20, 16)
         root.setSpacing(14)
+
+        # ---- 顶部：链接输入 + 读取 ----
+        urlrow = QHBoxLayout()
+        urlrow.setSpacing(8)
+        self.url_edit = QLineEdit(url)
+        self.url_edit.setPlaceholderText("在这里粘贴 B 站链接（合集 / 番剧 / 单个视频都行）")
+        self.url_edit.returnPressed.connect(self._reload)
+        btn_load = QPushButton("读取")
+        btn_load.setObjectName("ghost")
+        btn_load.setCursor(Qt.PointingHandCursor)
+        btn_load.clicked.connect(self._reload)
+        urlrow.addWidget(self.url_edit, 1)
+        urlrow.addWidget(btn_load)
+        root.addLayout(urlrow)
 
         # ---- 顶部：封面 + 名称 ----
         head = QFrame()
@@ -121,10 +142,14 @@ class CollectionDialog(QDialog):
         tbox = QVBoxLayout()
         tbox.setSpacing(4)
         t = QLabel(info.get("title") or "合集")
+        t.setObjectName("titleLabel")
         t.setStyleSheet("font-size:17px; font-weight:700; color:#1B1F27;")
         t.setWordWrap(True)
         tbox.addWidget(t)
-        sub = QLabel("%s · 共 %d 个视频" % (info.get("kind_label", "合集"), len(info.get("items") or [])))
+        owner = info.get("owner") or ""
+        sub = QLabel("%s · 共 %d 个%s" % (info.get("kind_label", "合集"), len(info.get("items") or []),
+                                          "　·　" + owner if owner else ""))
+        sub.setObjectName("subLabel")
         sub.setStyleSheet("font-size:12px; color:#9AA2B2;")
         tbox.addWidget(sub)
         if info.get("desc"):
@@ -162,7 +187,7 @@ class CollectionDialog(QDialog):
             "QScrollBar::handle:vertical{background:#C8D0DE;border-radius:4px;min-height:30px;}"
             "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}"
             "QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical{background:transparent;}")
-        items = info.get("items") or []
+        items = self.info.get("items") or []
         for i, it in enumerate(items):
             row = ItemRow(it, i)
             itw = QListWidgetItem()
@@ -182,7 +207,7 @@ class CollectionDialog(QDialog):
         cancel.setObjectName("ghost")
         cancel.setCursor(Qt.PointingHandCursor)
         cancel.clicked.connect(self.reject)
-        self.ok = QPushButton("下载选中的")
+        self.ok = QPushButton("确认下载")
         self.ok.setObjectName("primary")
         self.ok.setCursor(Qt.PointingHandCursor)
         self.ok.setMinimumWidth(130)
@@ -198,6 +223,53 @@ class CollectionDialog(QDialog):
         # 封面 + 缩略图后台加载
         self._cover_thread = None
         QTimer.singleShot(0, self._load_covers)
+
+    # ---------- 重新读取 ----------
+    def _reload(self):
+        """按当前链接重新读清单。"""
+        url = self.url_edit.text().strip()
+        if not url:
+            return
+        self.setCursor(Qt.WaitCursor)
+        try:
+            info = collection.fetch_preview(collection_client, url)
+        except Exception as e:
+            self.setCursor(Qt.ArrowCursor)
+            QMessageBox.warning(self, "读取失败", str(e))
+            return
+        self.setCursor(Qt.ArrowCursor)
+        if not info or not info.get("items"):
+            QMessageBox.information(self, "提示", "这个链接里没有可下载的内容")
+            return
+        self.info = info
+        self._rebuild()
+
+    def _rebuild(self):
+        """按新 info 重建列表。"""
+        info = self.info
+        self.setWindowTitle("BiliFetch · 浏览 · %s" % (info.get("title") or ""))
+        t = self.findChild(QLabel, "titleLabel")
+        if t:
+            t.setText(info.get("title") or "")
+        s = self.findChild(QLabel, "subLabel")
+        if s:
+            owner = info.get("owner") or ""
+            s.setText("%s · 共 %d 个%s" % (info.get("kind_label", "合集"),
+                                          len(info.get("items") or []),
+                                          "　·　" + owner if owner else ""))
+        self.list.clear()
+        self.rows = []
+        for i, it in enumerate(info.get("items") or []):
+            row = ItemRow(it, i)
+            itw = QListWidgetItem()
+            itw.setSizeHint(QSize(0, 80))
+            self.list.addItem(itw)
+            self.list.setItemWidget(itw, row)
+            self.rows.append(row)
+        for row in self.rows:
+            row.check.stateChanged.connect(self._update_count)
+        self._update_count()
+        self._load_covers()
 
     # ---------- 封面 ----------
     def _load_covers(self):
@@ -241,21 +313,22 @@ class CollectionDialog(QDialog):
         self._update_count()
 
     def _select_all(self):
-        for _, row in self._visible_rows():
+        """全选：作用于全部条目（不是只当前可见的），避免搜索后误以为只选了几条。"""
+        for row in self.rows:
             row.check.setChecked(True)
 
     def _select_none(self):
-        for _, row in self._visible_rows():
+        for row in self.rows:
             row.check.setChecked(False)
 
     def _invert(self):
-        for _, row in self._visible_rows():
+        for row in self.rows:
             row.check.setChecked(not row.check.isChecked())
 
     def _update_count(self):
         n = sum(1 for r in self.rows if r.check.isChecked())
         self.counter.setText("已选 %d / %d 个" % (n, len(self.rows)))
-        self.ok.setText("下载选中的 %d 个" % n if n else "请先选择")
+        self.ok.setText("确认下载 %d 个" % n if n else "请先选择")
         self.ok.setEnabled(n > 0)
 
     # ---------- 结果 ----------

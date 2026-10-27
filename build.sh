@@ -43,12 +43,16 @@ mkdir -p "$PAYLOAD/bin" "$PAYLOAD/lib/bilifetch"
 copyfile bilifetch.py "$PAYLOAD/lib/bilifetch/bilifetch.py"
 copyfile bilifetch_collection.py "$PAYLOAD/lib/bilifetch/bilifetch_collection.py"
 copyfile bilifetch_collection_gui.py "$PAYLOAD/lib/bilifetch/bilifetch_collection_gui.py"
+copyfile bilifetch_login.py "$PAYLOAD/lib/bilifetch/bilifetch_login.py"
+copyfile bilifetch_login_gui.py "$PAYLOAD/lib/bilifetch/bilifetch_login_gui.py"
 copyfile packaging/launcher.sh "$PAYLOAD/bin/bilifetch"
 copyfile README.md "$PAYLOAD/README.md"
 chmod 755 "$PAYLOAD/bin/bilifetch"
 chmod 644 "$PAYLOAD/lib/bilifetch/bilifetch.py" \
           "$PAYLOAD/lib/bilifetch/bilifetch_collection.py" \
-          "$PAYLOAD/lib/bilifetch/bilifetch_collection_gui.py" "$PAYLOAD/README.md"
+          "$PAYLOAD/lib/bilifetch/bilifetch_collection_gui.py" \
+          "$PAYLOAD/lib/bilifetch/bilifetch_login.py" \
+          "$PAYLOAD/lib/bilifetch/bilifetch_login_gui.py" "$PAYLOAD/README.md"
 
 # ---------------------------------------------------------------- macOS
 if [ "$(uname)" = "Darwin" ]; then
@@ -63,8 +67,11 @@ if [ "$(uname)" = "Darwin" ]; then
     fi
 
     if python3 -c "import PyQt5, PyInstaller" >/dev/null 2>&1; then
+        # 排除用不到的大包：qrcode 的静态扫描会把 numpy/cryptography 一起拖进来（白涨 43MB）
         python3 -m PyInstaller --noconfirm --windowed \
             --name BiliFetch \
+            --exclude-module numpy --exclude-module cryptography \
+            --exclude-module matplotlib --exclude-module pandas --exclude-module scipy \
             ${ICON:+--icon "$ICON"} \
             --osx-bundle-identifier io.github.lvyihanghh.bilifetch \
             --distpath "$STAGE" --workpath "$STAGE/pyi-work" --specpath "$STAGE" \
@@ -160,9 +167,13 @@ if python3 -c "import PyQt5" >/dev/null 2>&1 || [ -f packaging/gui/bilifetch_gui
     cp bilifetch_gui.py "$DEBROOT/usr/lib/bilifetch/bilifetch_gui.py"
     cp bilifetch_collection.py "$DEBROOT/usr/lib/bilifetch/bilifetch_collection.py"
     cp bilifetch_collection_gui.py "$DEBROOT/usr/lib/bilifetch/bilifetch_collection_gui.py"
+    cp bilifetch_login.py "$DEBROOT/usr/lib/bilifetch/bilifetch_login.py"
+    cp bilifetch_login_gui.py "$DEBROOT/usr/lib/bilifetch/bilifetch_login_gui.py"
     chmod 644 "$DEBROOT/usr/lib/bilifetch/bilifetch_gui.py" \
               "$DEBROOT/usr/lib/bilifetch/bilifetch_collection.py" \
-              "$DEBROOT/usr/lib/bilifetch/bilifetch_collection_gui.py"
+              "$DEBROOT/usr/lib/bilifetch/bilifetch_collection_gui.py" \
+              "$DEBROOT/usr/lib/bilifetch/bilifetch_login.py" \
+              "$DEBROOT/usr/lib/bilifetch/bilifetch_login_gui.py"
     cat > "$DEBROOT/usr/bin/bilifetch-gui" <<'GUI'
 #!/bin/sh
 exec /usr/bin/python3 /usr/lib/bilifetch/bilifetch_gui.py "$@"

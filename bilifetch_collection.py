@@ -203,6 +203,44 @@ def fetch_collection(client, url):
     }
 
 
+def fetch_preview(client, url):
+    """统一预览入口：合集/列表/收藏夹 -> 清单；单个视频 -> 它的分 P 清单。
+
+    返回和 fetch_collection 一样的结构，图形界面用同一个对话框展示。
+    """
+    if detect_collection(url):
+        return fetch_collection(client, url)
+
+    info = client.resolve(url)
+    pages = info.get("pages") or []
+    items = []
+    for i, p in enumerate(pages):
+        items.append({
+            "bvid": info["bvid"],
+            "cid": p.get("cid"),
+            "title": p.get("part") or ("P%d" % (i + 1)),
+            "duration": int(p.get("duration") or 0),
+            "pic": info.get("cover") or "",
+            "view": 0,
+        })
+    if not items:
+        items = [{
+            "bvid": info["bvid"], "cid": info.get("cid"),
+            "title": info.get("title") or info["bvid"],
+            "duration": int(info.get("duration") or 0),
+            "pic": info.get("cover") or "", "view": 0,
+        }]
+    return {
+        "title": info.get("title") or "",
+        "cover": info.get("cover") or "",
+        "desc": info.get("brief") or "",
+        "kind": "video",
+        "kind_label": "视频",
+        "owner": info.get("owner") or "",
+        "items": items,
+    }
+
+
 def format_duration(sec):
     """秒 -> mm:ss / h:mm:ss。"""
     sec = int(sec or 0)

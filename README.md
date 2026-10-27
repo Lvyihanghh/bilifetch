@@ -57,6 +57,7 @@ sudo dpkg -i bilifetch_1.0.0_all.deb
 | Python 3.7+ | App 自带，不用装 | `apt install python3` |
 | requests | App 自带 | `apt install python3-requests` |
 | PyQt5 | App 自带 | `apt install python3-pyqt5`（deb 已声明依赖） |
+| qrcode | App 自带 | `apt install python3-qrcode`（deb 已声明依赖） |
 | ffmpeg | `brew install ffmpeg` | `apt install ffmpeg` |
 
 只有 **ffmpeg** 需要用户自己装 —— macOS 一条命令：`brew install ffmpeg`。
@@ -78,14 +79,17 @@ python3 bilifetch_gui.py        # 图形界面
 
 ## 2. 图形界面
 
+主界面只做三件事：**贴链接 → 点「浏览…」→ 勾选 → 确认下载**。
+
 | 区域 | 说明 |
 |---|---|
-| 链接 | 粘贴 B 站链接，回车或点「开始下载」 |
+| 链接 | 粘贴 B 站链接（合集 / 番剧 / 单个视频都行） |
+| **浏览…** | 主按钮。点它读出内容并弹出预览窗口 |
 | 保存到 | 默认 `~/Downloads/BiliFetch`，可改 |
 | 画质 | 最高可得 / 4K / 1080P / 720P / 480P / 360P |
 | 整季下载 | 番剧链接时勾上，下整季 |
 | 只下音频 | 只下音频（输出 .m4a） |
-| 高级 | Cookie（登录才有高清）、代理 |
+| 高级 | **扫码登录**、Cookie、代理 |
 | 下载队列 | 每集一行：序号 + 标题 + 状态标签 + 细进度条 + 百分比/速度 |
 | 运行日志 | 解析结果、画质、速度等，可复制/清空 |
 | 状态栏 | 当前状态 + 「打开输出目录」 |
@@ -93,10 +97,21 @@ python3 bilifetch_gui.py        # 图形界面
 界面用 PyQt5 写的，打包成 `.app` 走 PyInstaller（用户机器不需要装 Python）。
 图形界面和命令行**共用 `bilifetch.py` 里的同一套下载逻辑**，行为一致。
 
-### 合集：先预览再挑着下
+### 登录 B 站（拿高清画质）
 
-粘的是**合集 / 视频列表 / 收藏夹**链接时，不会直接开下，而是先弹一个预览窗口，
-把里面的视频全列出来让你挑：
+![扫码登录](docs/screenshot-login.png)
+
+**高级 → 扫码登录** → 用手机 B 站 App 扫二维码 → 手机上确认 → 自动登录成功。
+
+- 二维码有效期 **180 秒**，过期了点「刷新二维码」
+- 登录态保存在 `~/Library/Application Support/BiliFetch/settings.json`（Linux 是 `~/.config/bilifetch/`），
+  启动时自动检查有效性，失效了会提示重新登录
+- **不登录只能拿到 480P**，1080P 及以上需要登录（普通账号 1080P，大会员 4K/杜比）
+
+### 浏览：先预览再挑着下
+
+点「浏览…」后弹出的窗口，会把链接里的内容**列成清单**让你挑：
+合集 / 视频列表 / 收藏夹会列出全部视频；单个视频会列出它的各个分 P。
 
 ![合集预览](docs/screenshot-collection.png)
 
@@ -118,7 +133,7 @@ python3 bilifetch_gui.py        # 图形界面
 
 - 缩略图和封面后台异步加载，不卡界面
 - 搜索框按标题过滤（91 个视频也能快速定位）
-- 全选 / 全不选 / 反选只作用于**当前可见**的行
+- 全选 / 全不选 / 反选作用于**全部**条目（不受搜索过滤影响）
 - 一个视频有多个分 P 时会全部下载（第 2 P 起文件名加「- 分P名」后缀）
 
 支持的链接形态：
@@ -317,8 +332,10 @@ cd dist && shasum -a 256 -c SHA256SUMS
 ```
 bilifetch.py              下载核心（单文件，命令行 + 图形界面都调它）
 bilifetch_gui.py          PyQt5 图形界面（主窗口）
-bilifetch_collection.py   合集 / 列表 / 收藏夹的解析与列举
-bilifetch_collection_gui.py  合集预览与选择对话框
+bilifetch_collection.py      合集 / 列表 / 收藏夹的解析与列举
+bilifetch_collection_gui.py  浏览 / 预览与选择对话框
+bilifetch_login.py           B 站扫码登录（核心）
+bilifetch_login_gui.py       扫码登录对话框（显示二维码 + 轮询）
 build.sh                 打包脚本
 packaging/
 ├── launcher.sh          命令启动器（mac/Linux 共用，靠相对路径找 lib）

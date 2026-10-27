@@ -244,6 +244,8 @@ class BiliClient:
             "title": view.get("title") or "",
             "owner": (view.get("owner") or {}).get("name") or "",
             "duration": view.get("duration") or 0,
+            "cover": view.get("pic") or "",
+            "brief": view.get("desc") or "",
             "pages": pages,
             "is_pgc": is_pgc,
             "episodes": [],

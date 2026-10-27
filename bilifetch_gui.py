@@ -31,6 +31,9 @@ from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileD
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bilifetch as core          # noqa: E402
 import bilifetch_collection as collection        # noqa: E402
+import bilifetch_collection_gui as collection_gui     # noqa: E402
+import bilifetch_login as login_mod                    # noqa: E402
+from bilifetch_login_gui import LoginDialog             # noqa: E402
 from bilifetch_collection_gui import CollectionDialog   # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -701,6 +704,7 @@ class MainWindow(QMainWindow):
         self._anims = []
         self._build_ui()
         self._load_settings()
+        QTimer.singleShot(400, self._check_login)
 
     # ---------------- 界面 ----------------
     def _build_ui(self):
@@ -744,11 +748,12 @@ class MainWindow(QMainWindow):
         row.setSpacing(10)
         self.url_edit = QLineEdit()
         self.url_edit.setPlaceholderText("粘贴 B 站链接，回车即可开始")
-        self.url_edit.returnPressed.connect(self.on_start)
-        self.btn_start = FloatButton("开始下载", "primary")
-        self.btn_start.setGlyph("play", "#ffffff", 13)
+        self.url_edit.returnPressed.connect(self.on_browse)
+        self.btn_start = FloatButton("浏览…", "primary")
+        self.btn_start.setGlyph("film", "#ffffff", 14)
         self.btn_start.setMinimumWidth(122)
-        self.btn_start.clicked.connect(self.on_start)
+        self.btn_start.setToolTip("读取链接内容，预览后挑着下载")
+        self.btn_start.clicked.connect(self.on_browse)
         row.addWidget(self.url_edit, 1)
         row.addWidget(self.btn_start)
         card.layout.addLayout(row)
@@ -806,9 +811,15 @@ class MainWindow(QMainWindow):
         av.addWidget(self.cookie_edit, 1)
         av.addWidget(IconLabel("代理", "gear"))
         av.addWidget(self.proxy_edit, 0)
+        self.btn_login = FloatButton("扫码登录", "ghost")
+        self.btn_login.setGlyph("play", INK_2, 13)
+        self.btn_login.setCursor(Qt.PointingHandCursor)
+        self.btn_login.setFixedWidth(96)
+        self.btn_login.clicked.connect(self.on_login)
+        av.addWidget(self.btn_login)
         self.adv_card.layout.addLayout(av)
         self.adv_card.setVisible(False)
-        self.chk_adv = QCheckBox("显示高级设置（Cookie / 代理）")
+        self.chk_adv = QCheckBox("显示高级设置（扫码登录 / Cookie / 代理）")
         self.chk_adv.setCursor(Qt.PointingHandCursor)
         self.chk_adv.toggled.connect(self._toggle_adv)
         root.addWidget(self.chk_adv)
@@ -833,7 +844,7 @@ class MainWindow(QMainWindow):
 
         self.list = QListWidget()
         self.list.setMinimumHeight(110)
-        self.empty_hint = QLabel("还没有任务 —— 把 B 站链接粘到上面，点「开始下载」")
+        self.empty_hint = QLabel("还没有任务 —— 把 B 站链接粘到上面，点「浏览…」挑选内容")
         self.empty_hint.setObjectName("hint")
         self.empty_hint.setAlignment(Qt.AlignCenter)
         qcard.layout.addWidget(self.empty_hint)
@@ -934,6 +945,18 @@ class MainWindow(QMainWindow):
             self.adv_card.setVisible(False)
 
     # ---------------- 事件 ----------------
+    def on_login(self):
+        """扫码登录，拿到 Cookie 后存下来（高清画质需要）。"""
+        dlg = LoginDialog(self)
+        dlg.exec_()
+        if not dlg.cookie:
+            self.status_msg.setText("未登录")
+            return
+        self.cookie_edit.setText(dlg.cookie)
+        self.btn_login.setText(dlg.nickname or "已登录")
+        self.status_msg.setText("已登录：%s" % (dlg.nickname or ""))
+        self.append_log("登录成功：%s（高清画质已解锁）" % (dlg.nickname or ""))
+
     def on_pick_dir(self):
         d = QFileDialog.getExistingDirectory(self, "选择保存目录", self.out_edit.text())
         if d:
@@ -981,7 +1004,8 @@ class MainWindow(QMainWindow):
             "支持番剧 ep/ss、普通视频 av/bv、b23.tv 短链。\n\n"
             "仅供学习研究，请遵守 B 站用户协议。" % core.VERSION)
 
-    def on_start(self):
+    def on_browse(self):
+        """浏览：读出链接内容 -> 预览 -> 勾选 -> 确认下载。"""
         if self.thread and self.thread.isRunning():
             return
         url = self.url_edit.text().strip()
@@ -989,33 +1013,27 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "提示", "先粘贴一个 B 站链接")
             return
 
-        # 合集 / 列表 / 收藏夹链接 -> 先给预览让用户挑
-        if collection.detect_collection(url):
-            self.pick_from_collection(url)
-            return
-
-        self._start_download(url, items=None)
-
-    def pick_from_collection(self, url):
-        """读取合集内容并弹出预览选择框。"""
         self.btn_start.setEnabled(False)
-        self.status_msg.setText("正在读取合集…")
+        self.status_msg.setText("正在读取…")
         QApplication.processEvents()
         try:
             client = core.BiliClient(cookie=self.cookie_edit.text().strip(),
                                      proxy=self.proxy_edit.text().strip() or None)
-            info = collection.fetch_collection(client, url)
+            collection_gui.collection_client = client
+            info = collection.fetch_preview(client, url)
         except Exception as e:
             self.btn_start.setEnabled(True)
-            self.status_msg.setText("读取合集失败")
-            QMessageBox.warning(self, "读取合集失败", str(e))
+            self.status_msg.setText("读取失败")
+            QMessageBox.warning(self, "读取失败", str(e))
             return
         self.btn_start.setEnabled(True)
         self.status_msg.setText("就绪")
         if not info or not info.get("items"):
-            QMessageBox.information(self, "提示", "这个合集里没有可下载的视频")
+            QMessageBox.information(self, "提示", "这个链接里没有可下载的内容")
             return
-        dlg = CollectionDialog(info, self)
+
+        dlg = CollectionDialog(info, url, self)
+        dlg.url_edit.setText(url)
         if dlg.exec_() == QDialog.Accepted:
             items = dlg.selected_items()
             if items:
@@ -1145,6 +1163,19 @@ class MainWindow(QMainWindow):
         except Exception:
             self.out_edit.setText(default)
 
+    def _check_login(self):
+        """启动时看看存的 Cookie 还能不能用。"""
+        cookie = self.cookie_edit.text().strip()
+        if not cookie:
+            return
+        name = login_mod.check_login(cookie, self.proxy_edit.text().strip() or None)
+        if name:
+            self.btn_login.setText(name)
+            self.status_msg.setText("已登录：%s" % name)
+        else:
+            self.cookie_edit.clear()
+            self.status_msg.setText("Cookie 已失效，请重新登录")
+
     def _save_settings(self):
         try:
             with open(self._settings_path(), "w", encoding="utf-8") as fp:
@@ -1215,6 +1246,18 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--selftest":
         out_dir = sys.argv[3] if len(sys.argv) > 3 else os.path.expanduser("~/Downloads")
         sys.exit(selftest(sys.argv[2], out_dir))
+    if len(sys.argv) > 1 and sys.argv[1] == "--selftest-login":
+        # 生成二维码存成 png：验证打包后 qrcode / PIL 都在（登录功能能不能用的关键）
+        try:
+            png, key = login_mod.QrLogin().make_qr_png()
+            out = os.path.join(tempfile.gettempdir(), "bilifetch_qr.png")
+            with open(out, "wb") as fp:
+                fp.write(png)
+            print("OK %s %d bytes" % (key, len(png)))
+            sys.exit(0)
+        except Exception as e:
+            print("FAIL %s" % e)
+            sys.exit(1)
     if len(sys.argv) > 1 and sys.argv[1] == "--selftest-collection":
         out_dir = sys.argv[3] if len(sys.argv) > 3 else os.path.expanduser("~/Downloads")
         sys.exit(selftest_collection(sys.argv[2], out_dir))
