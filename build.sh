@@ -231,6 +231,11 @@ for root, dirs, files in os.walk("."):
 print("    清掉 %d 个旁挂/元数据文件" % n)
 PY
 
+# .git 里的也要清：exFAT 存不了 POSIX 权限位，macOS 会给 0755/0444 的文件生成
+# ._ 旁挂文件；git 的 pack 文件正好是 0444，git 会把旁挂误当成 pack 索引去读，
+# 于是报 "non-monotonic index .git/objects/pack/._pack-xxx.idx"。
+find .git -name '._*' -type f -delete 2>/dev/null || true
+
 echo ""
 echo "==> 完成，产物在 $ROOT/$DIST/"
 ls -la "$DIST"
