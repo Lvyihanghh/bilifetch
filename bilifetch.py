@@ -121,7 +121,15 @@ class BiliClient:
             "Accept-Language": "zh-CN,zh;q=0.9",
         })
         if cookie:
-            self.session.headers["Cookie"] = cookie
+            # 放进 cookie jar（domain=.bilibili.com）：
+            # 一是 requests 不会用 jar 里的 cookie 覆盖我们设的 header，
+            # 二是 CDN（*.bilivideo.com）拿不到 B 站 cookie，不至于泄漏出去。
+            for part in cookie.split(";"):
+                if "=" in part:
+                    k, v = part.strip().split("=", 1)
+                    if k:
+                        self.session.cookies.set(k.strip(), v.strip(),
+                                                domain=".bilibili.com", path="/")
         self._wbi_img = None
         self._pgc_cache = {}
 
@@ -167,6 +175,12 @@ class BiliClient:
         return self.get_json(url)
 
     # ---------- 链接解析 ----------
+
+    @property
+    def has_login(self):
+        """有没有带上 SESSDATA（即是否已登录）。"""
+        return bool(self.session.cookies.get("SESSDATA", domain=".bilibili.com")
+                    or self.session.cookies.get("SESSDATA"))
 
     def resolve(self, text):
         """把用户输入解析成 {'bvid','cid','title','episodes','is_pgc'}。"""
@@ -554,6 +568,10 @@ def download_episode(client, bvid, cid, name, out_dir, quality=0, threads=8, cdn
     say("画质：%s (id=%s)  可选：%s" %
         (QN_NAME.get(got_quality, str(got_quality)), got_quality,
          ",".join(str(q) for q in accept)))
+    if got_quality and got_quality < 80 and not client.has_login:   # 低于 1080P
+        say('提示：未登录时 B 站会限制画质（当前只给到 %s）。'
+            '图形界面右上角「扫码登录」可解锁 1080P 及以上；'
+            '命令行加 -c "SESSDATA=..." 也行。' % QN_NAME.get(got_quality, str(got_quality)))
 
     stem = sanitize(name)
     ext = ".m4a" if audio_only else ".mp4"

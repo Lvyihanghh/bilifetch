@@ -739,6 +739,14 @@ class MainWindow(QMainWindow):
         head.addWidget(logo)
         head.addLayout(titles)
         head.addStretch(1)
+        # 登录入口放主界面右上角，必须一眼能看到（之前藏在折叠的「高级」里，等于没有）
+        self.btn_login = FloatButton("扫码登录 · 解锁 1080P", "primary")
+        self.btn_login.setGlyph("play", "#ffffff", 13)
+        self.btn_login.setCursor(Qt.PointingHandCursor)
+        self.btn_login.setFixedHeight(34)
+        self.btn_login.setToolTip("用手机 B 站 App 扫码登录，未登录最高只能拿到 480P")
+        self.btn_login.clicked.connect(self.on_login)
+        head.addWidget(self.btn_login)
         root.addLayout(head)
         root.addSpacing(2)
 
@@ -782,6 +790,7 @@ class MainWindow(QMainWindow):
         for label, qid in QUALITY_CHOICES:
             self.quality_box.addItem(label, qid)
         self.quality_box.setCursor(Qt.PointingHandCursor)
+        self.quality_box.setToolTip("未登录时 B 站最高只给 480P，登录后才有 1080P 及以上")
         col2 = QHBoxLayout()
         col2.setSpacing(8)
         col2.addWidget(IconLabel("画质", "film"))
@@ -811,12 +820,7 @@ class MainWindow(QMainWindow):
         av.addWidget(self.cookie_edit, 1)
         av.addWidget(IconLabel("代理", "gear"))
         av.addWidget(self.proxy_edit, 0)
-        self.btn_login = FloatButton("扫码登录", "ghost")
-        self.btn_login.setGlyph("play", INK_2, 13)
-        self.btn_login.setCursor(Qt.PointingHandCursor)
-        self.btn_login.setFixedWidth(96)
-        self.btn_login.clicked.connect(self.on_login)
-        av.addWidget(self.btn_login)
+        av.addWidget(IconLabel("Cookie", "gear"))
         self.adv_card.layout.addLayout(av)
         self.adv_card.setVisible(False)
         self.chk_adv = QCheckBox("显示高级设置（扫码登录 / Cookie / 代理）")
@@ -945,6 +949,17 @@ class MainWindow(QMainWindow):
             self.adv_card.setVisible(False)
 
     # ---------------- 事件 ----------------
+    def _set_login_state(self, nickname):
+        """更新右上角登录按钮的显示。"""
+        if nickname:
+            self.btn_login.setText("已登录：%s" % nickname)
+            self.btn_login.setGlyph("play", "#ffffff", 13)
+            self.btn_login.setToolTip("已登录，可下 1080P 及以上")
+        else:
+            self.btn_login.setText("扫码登录 · 解锁 1080P")
+            self.btn_login.setGlyph("play", "#ffffff", 13)
+            self.btn_login.setToolTip("用手机 B 站 App 扫码登录，未登录最高只能拿到 480P")
+
     def on_login(self):
         """扫码登录，拿到 Cookie 后存下来（高清画质需要）。"""
         dlg = LoginDialog(self)
@@ -953,7 +968,7 @@ class MainWindow(QMainWindow):
             self.status_msg.setText("未登录")
             return
         self.cookie_edit.setText(dlg.cookie)
-        self.btn_login.setText(dlg.nickname or "已登录")
+        self._set_login_state(dlg.nickname or "已登录")
         self.status_msg.setText("已登录：%s" % (dlg.nickname or ""))
         self.append_log("登录成功：%s（高清画质已解锁）" % (dlg.nickname or ""))
 
@@ -1170,11 +1185,12 @@ class MainWindow(QMainWindow):
             return
         name = login_mod.check_login(cookie, self.proxy_edit.text().strip() or None)
         if name:
-            self.btn_login.setText(name)
+            self._set_login_state(name)
             self.status_msg.setText("已登录：%s" % name)
         else:
             self.cookie_edit.clear()
-            self.status_msg.setText("Cookie 已失效，请重新登录")
+            self._set_login_state(None)
+            self.status_msg.setText("未登录：画质最高 480P，点右上角扫码登录解锁高清")
 
     def _save_settings(self):
         try:
