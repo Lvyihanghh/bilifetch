@@ -714,6 +714,26 @@ def main():
 
     # ---------- 解析链接 ----------
     log("解析链接：%s" % args.url)
+    # 合集 / 列表 / 收藏夹：先列出来（图形界面里可以逐个勾选）
+    try:
+        import bilifetch_collection as collection_mod
+    except ImportError:
+        collection_mod = None
+    if collection_mod and collection_mod.detect_collection(args.url):
+        info = collection_mod.fetch_collection(client, args.url)
+        if not info or not info.get("items"):
+            log("这个%s里没有可下载的视频" % info.get("kind_label", "合集"))
+            return 1
+        log("  %s：%s（%d 个视频）" % (info["kind_label"], info["title"], len(info["items"])))
+        for i, it in enumerate(info["items"], 1):
+            log("   %3d. %s %8s  %s" % (i,
+                     collection_mod.pad_display(it["title"][:40], 56),
+                     collection_mod.format_duration(it["duration"]),
+                     collection_mod.format_views(it["view"]) + " 播放"))
+        log("")
+        log("这是%s，命令行只能整份下载。" % info["kind_label"])
+        log("想挑着下，请用图形界面：BiliFetch.app（macOS）或 bilifetch-gui（Linux）。")
+        return 0
     info = client.resolve(args.url)
     log("  标题：%s" % info["title"])
     log("  UP主：%s   时长：%d 秒" % (info["owner"], info["duration"]))

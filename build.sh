@@ -41,10 +41,14 @@ echo "==> 准备 payload"
 PAYLOAD="$STAGE/payload"
 mkdir -p "$PAYLOAD/bin" "$PAYLOAD/lib/bilifetch"
 copyfile bilifetch.py "$PAYLOAD/lib/bilifetch/bilifetch.py"
+copyfile bilifetch_collection.py "$PAYLOAD/lib/bilifetch/bilifetch_collection.py"
+copyfile bilifetch_collection_gui.py "$PAYLOAD/lib/bilifetch/bilifetch_collection_gui.py"
 copyfile packaging/launcher.sh "$PAYLOAD/bin/bilifetch"
 copyfile README.md "$PAYLOAD/README.md"
 chmod 755 "$PAYLOAD/bin/bilifetch"
-chmod 644 "$PAYLOAD/lib/bilifetch/bilifetch.py" "$PAYLOAD/README.md"
+chmod 644 "$PAYLOAD/lib/bilifetch/bilifetch.py" \
+          "$PAYLOAD/lib/bilifetch/bilifetch_collection.py" \
+          "$PAYLOAD/lib/bilifetch/bilifetch_collection_gui.py" "$PAYLOAD/README.md"
 
 # ---------------------------------------------------------------- macOS
 if [ "$(uname)" = "Darwin" ]; then
@@ -79,9 +83,11 @@ if [ "$(uname)" = "Darwin" ]; then
              "$PKGROOT/usr/local/share/doc/bilifetch"
     cp "$PAYLOAD/bin/bilifetch" "$PKGROOT/usr/local/bin/bilifetch"
     cp "$PAYLOAD/lib/bilifetch/bilifetch.py" "$PKGROOT/usr/local/lib/bilifetch/bilifetch.py"
+    cp "$PAYLOAD/lib/bilifetch/bilifetch_collection.py" "$PKGROOT/usr/local/lib/bilifetch/bilifetch_collection.py"
     cp "$PAYLOAD/README.md" "$PKGROOT/usr/local/share/doc/bilifetch/README.md"
     chmod 755 "$PKGROOT/usr/local/bin/bilifetch"
     chmod 644 "$PKGROOT/usr/local/lib/bilifetch/bilifetch.py" \
+              "$PKGROOT/usr/local/lib/bilifetch/bilifetch_collection.py" \
               "$PKGROOT/usr/local/share/doc/bilifetch/README.md"
 
     # 脚本先拷到本地盘：直接从 exFAT 拷会带上 ._postinstall 之类的旁挂文件
@@ -152,7 +158,11 @@ chmod 644 "$DEBROOT/usr/lib/bilifetch/bilifetch.py" "$DEBROOT/usr/share/doc/bili
 # 图形界面（依赖系统的 python3-pyqt5）
 if python3 -c "import PyQt5" >/dev/null 2>&1 || [ -f packaging/gui/bilifetch_gui.py ]; then
     cp bilifetch_gui.py "$DEBROOT/usr/lib/bilifetch/bilifetch_gui.py"
-    chmod 644 "$DEBROOT/usr/lib/bilifetch/bilifetch_gui.py"
+    cp bilifetch_collection.py "$DEBROOT/usr/lib/bilifetch/bilifetch_collection.py"
+    cp bilifetch_collection_gui.py "$DEBROOT/usr/lib/bilifetch/bilifetch_collection_gui.py"
+    chmod 644 "$DEBROOT/usr/lib/bilifetch/bilifetch_gui.py" \
+              "$DEBROOT/usr/lib/bilifetch/bilifetch_collection.py" \
+              "$DEBROOT/usr/lib/bilifetch/bilifetch_collection_gui.py"
     cat > "$DEBROOT/usr/bin/bilifetch-gui" <<'GUI'
 #!/bin/sh
 exec /usr/bin/python3 /usr/lib/bilifetch/bilifetch_gui.py "$@"

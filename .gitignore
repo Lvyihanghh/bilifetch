@@ -10,6 +10,9 @@
 /dist/
 /build/
 
+# ---- 临时测试脚本 ----
+.tmp_*
+
 # ---- 运行时产物 ----
 /downloads/
 *.part

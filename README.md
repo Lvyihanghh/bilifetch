@@ -93,6 +93,45 @@ python3 bilifetch_gui.py        # 图形界面
 界面用 PyQt5 写的，打包成 `.app` 走 PyInstaller（用户机器不需要装 Python）。
 图形界面和命令行**共用 `bilifetch.py` 里的同一套下载逻辑**，行为一致。
 
+### 合集：先预览再挑着下
+
+粘的是**合集 / 视频列表 / 收藏夹**链接时，不会直接开下，而是先弹一个预览窗口，
+把里面的视频全列出来让你挑：
+
+![合集预览](docs/screenshot-collection.png)
+
+```
+┌─ BiliFetch · 选择要下载的视频 ─────────────────────┐
+│  ┌────┐  数码评测                                  │
+│  │封面│  视频列表 · 共 91 个视频                    │
+│  └────┘  从显卡到CPU，从手机到平板…                 │
+│                                                       │
+│  [搜索标题…]              [全选][全不选][反选]         │
+│  ┌───────────────────────────────────────────────┐  │
+│  │ ☑ │ [缩略图] │ 【极客湾】终极核弹降临！…        │  │
+│  │   │           │ 19:48 · 147.5 万 播放          │  │
+│  └───────────────────────────────────────────────┘  │
+│                                          已选 2 / 91   │
+│                              [取消]  [下载选中的 2 个]  │
+└───────────────────────────────────────────────────────┘
+```
+
+- 缩略图和封面后台异步加载，不卡界面
+- 搜索框按标题过滤（91 个视频也能快速定位）
+- 全选 / 全不选 / 反选只作用于**当前可见**的行
+- 一个视频有多个分 P 时会全部下载（第 2 P 起文件名加「- 分P名」后缀）
+
+支持的链接形态：
+
+| 形态 | 例子 |
+|---|---|
+| UP 主合集 | `space.bilibili.com/{mid}/lists/{sid}?type=season` |
+| UP 主视频列表 | `space.bilibili.com/{mid}/lists/{sid}?type=series` |
+| 老格式合集 | `space.bilibili.com/{mid}/channel/seriesdetail?sid={sid}` |
+| 收藏夹 | `space.bilibili.com/{mid}/favlist?fid={fid}` |
+
+命令行遇到合集链接会把清单列出来，并提示用图形界面挑着下。
+
 ### 做了哪些打磨
 
 - **自绘控件**：按钮、进度条、状态标签都是 QPainter 画的，不是系统默认样式
@@ -277,7 +316,9 @@ cd dist && shasum -a 256 -c SHA256SUMS
 
 ```
 bilifetch.py              下载核心（单文件，命令行 + 图形界面都调它）
-bilifetch_gui.py          PyQt5 图形界面
+bilifetch_gui.py          PyQt5 图形界面（主窗口）
+bilifetch_collection.py   合集 / 列表 / 收藏夹的解析与列举
+bilifetch_collection_gui.py  合集预览与选择对话框
 build.sh                 打包脚本
 packaging/
 ├── launcher.sh          命令启动器（mac/Linux 共用，靠相对路径找 lib）

@@ -22,7 +22,7 @@ from PyQt5.QtCore import (QEasingCurve, QPoint, QPropertyAnimation, QRect, QRect
                           Qt, QTimer, QObject, QThread, pyqtProperty, pyqtSignal, pyqtSlot)
 from PyQt5.QtGui import (QBrush, QColor, QFont, QFontMetrics, QIcon, QLinearGradient, QPainter,
                          QPainterPath, QPen, QPixmap)
-from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog, QFrame,
+from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame,
                              QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLineEdit,
                              QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
                              QPlainTextEdit, QPushButton, QSizePolicy, QStatusBar,
@@ -30,6 +30,8 @@ from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog, QF
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bilifetch as core          # noqa: E402
+import bilifetch_collection as collection        # noqa: E402
+from bilifetch_collection_gui import CollectionDialog   # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -115,6 +117,29 @@ QComboBox QAbstractItemView {
     selection-background-color: %BLUE%;
     selection-color: #ffffff;
 }
+
+/* 主界面用自绘的 FloatButton；这里的规则给合集对话框等原生按钮用 */
+QPushButton {
+    border: none;
+    border-radius: 10px;
+    padding: 9px 18px;
+    font-weight: 600;
+}
+QPushButton#primary {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 %PINK%, stop:1 %BLUE%);
+    color: #ffffff;
+}
+QPushButton#primary:hover {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #f2648d, stop:1 #1f9dd1);
+}
+QPushButton#primary:disabled { background: #CFD6E2; color: #F2F5F9; }
+QPushButton#ghost {
+    background: #EEF1F7;
+    color: %INK_2%;
+    padding: 8px 16px;
+}
+QPushButton#ghost:hover { background: #E3E8F2; }
+QPushButton#ghost:pressed { background: #D8DFEB; }
 
 QCheckBox { color: %INK_2%; spacing: 8px; }
 QCheckBox::indicator {
@@ -558,9 +583,11 @@ class Worker(QObject):
     cancelled = pyqtSignal(str)
     all_done = pyqtSignal()
 
-    def __init__(self, url, out_dir, quality, all_episodes, cookie, threads, proxy):
+    def __init__(self, url, out_dir, quality, all_episodes, cookie, threads, proxy,
+                 items=None):
         super().__init__()
         self.url = url
+        self.items = items          # 直接指定要下的视频（合集勾选结果）
         self.out_dir = out_dir
         self.quality = quality
         self.all_episodes = all_episodes
@@ -586,12 +613,34 @@ class Worker(QObject):
 
     def _run(self):
         client = core.BiliClient(cookie=self.cookie, proxy=self.proxy or None)
-        self.log_line.emit("解析链接：%s" % self.url)
-        info = client.resolve(self.url)
-        self.log_line.emit("  标题：%s" % info["title"])
-        self.log_line.emit("  UP主：%s   时长：%d 秒" % (info["owner"], info["duration"]))
-
-        jobs = core.plan_jobs(client, info, all_episodes=self.all_episodes)
+        if self.items:
+            # 合集勾选结果：展开成具体分 P（一个视频可能有多个分 P，全下）
+            jobs = []
+            for it in self.items:
+                title = it.get("title") or it["bvid"]
+                cid = it.get("cid")
+                if cid is None:
+                    try:
+                        pages = client.pagelist(it["bvid"])
+                    except Exception:
+                        pages = []
+                    if not pages:
+                        continue
+                    if len(pages) == 1:
+                        jobs.append((title, it["bvid"], pages[0]["cid"]))
+                    else:
+                        for i, p in enumerate(pages):
+                            part = p.get("part") or "P%d" % p.get("page")
+                            name = title if i == 0 else "%s - %s" % (title, part)
+                            jobs.append((name, it["bvid"], p["cid"]))
+                else:
+                    jobs.append((title, it["bvid"], cid))
+        else:
+            self.log_line.emit("解析链接：%s" % self.url)
+            info = client.resolve(self.url)
+            self.log_line.emit("  标题：%s" % info["title"])
+            self.log_line.emit("  UP主：%s   时长：%d 秒" % (info["owner"], info["duration"]))
+            jobs = core.plan_jobs(client, info, all_episodes=self.all_episodes)
         self.log_line.emit("  待下载：%d 集" % len(jobs))
 
         ffmpeg = core.find_executable("ffmpeg")
@@ -615,6 +664,9 @@ class Worker(QObject):
             def on_stage(text, _n=name):
                 self.progress_changed.emit(_n, 0, 0, text)
 
+            if cid is None:
+                self.log_line.emit("  跳过（拿不到 cid）：%s" % name)
+                continue
             try:
                 out = core.download_episode(
                     client, bvid, cid, name, self.out_dir,
@@ -936,6 +988,40 @@ class MainWindow(QMainWindow):
         if not url:
             QMessageBox.information(self, "提示", "先粘贴一个 B 站链接")
             return
+
+        # 合集 / 列表 / 收藏夹链接 -> 先给预览让用户挑
+        if collection.detect_collection(url):
+            self.pick_from_collection(url)
+            return
+
+        self._start_download(url, items=None)
+
+    def pick_from_collection(self, url):
+        """读取合集内容并弹出预览选择框。"""
+        self.btn_start.setEnabled(False)
+        self.status_msg.setText("正在读取合集…")
+        QApplication.processEvents()
+        try:
+            client = core.BiliClient(cookie=self.cookie_edit.text().strip(),
+                                     proxy=self.proxy_edit.text().strip() or None)
+            info = collection.fetch_collection(client, url)
+        except Exception as e:
+            self.btn_start.setEnabled(True)
+            self.status_msg.setText("读取合集失败")
+            QMessageBox.warning(self, "读取合集失败", str(e))
+            return
+        self.btn_start.setEnabled(True)
+        self.status_msg.setText("就绪")
+        if not info or not info.get("items"):
+            QMessageBox.information(self, "提示", "这个合集里没有可下载的视频")
+            return
+        dlg = CollectionDialog(info, self)
+        if dlg.exec_() == QDialog.Accepted:
+            items = dlg.selected_items()
+            if items:
+                self._start_download(url, items=items)
+
+    def _start_download(self, url, items=None):
         out_dir = self.out_edit.text().strip() or os.path.join(
             os.path.expanduser("~"), "Downloads", "BiliFetch")
         os.makedirs(out_dir, exist_ok=True)
@@ -955,7 +1041,8 @@ class MainWindow(QMainWindow):
             quality=self.quality_box.currentData(),
             all_episodes=self.chk_all.isChecked(),
             cookie=self.cookie_edit.text().strip(),
-            threads=8, proxy=self.proxy_edit.text().strip())
+            threads=8, proxy=self.proxy_edit.text().strip(),
+            items=items)
         self.thread = QThread()
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
@@ -1102,11 +1189,35 @@ def selftest(url, out_dir):
         return 1
 
 
+def selftest_collection(url, out_dir):
+    """打包自检：读合集 -> 取第一个视频 -> 真下载一次。"""
+    try:
+        client = core.BiliClient()
+        info = collection.fetch_collection(client, url)
+        if not info or not info.get("items"):
+            raise RuntimeError("合集里没有视频")
+        it = info["items"][0]
+        pages = client.pagelist(it["bvid"])
+        out = core.download_episode(client, it["bvid"], pages[0]["cid"],
+                                     it["title"], out_dir,
+                                     ffmpeg=core.find_executable("ffmpeg"))
+        with open(SELFTEST_RESULT, "w", encoding="utf-8") as fp:
+            fp.write("OK\n%s %s\n%s\n" % (info["title"], len(info["items"]), out))
+        return 0
+    except Exception as e:
+        with open(SELFTEST_RESULT, "w", encoding="utf-8") as fp:
+            fp.write("FAIL\n%s\n" % e)
+        return 1
+
+
 def main():
-    # 打包自检：--selftest <链接> <输出目录>
+    # 打包自检：--selftest <链接> <输出目录> / --selftest-collection <合集链接> <输出目录>
     if len(sys.argv) > 1 and sys.argv[1] == "--selftest":
         out_dir = sys.argv[3] if len(sys.argv) > 3 else os.path.expanduser("~/Downloads")
         sys.exit(selftest(sys.argv[2], out_dir))
+    if len(sys.argv) > 1 and sys.argv[1] == "--selftest-collection":
+        out_dir = sys.argv[3] if len(sys.argv) > 3 else os.path.expanduser("~/Downloads")
+        sys.exit(selftest_collection(sys.argv[2], out_dir))
 
     app = QApplication(sys.argv)
     app.setApplicationName("BiliFetch")
