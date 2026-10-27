@@ -1,0 +1,37 @@
+# ---- 别的项目（不是本项目的）----
+/qq-mcp/
+/watchdog/
+
+# ---- 上游参考源码（NiceLee 的仓库，不是本项目的代码，别推上去）----
+/BilibiliDown-6.41/
+*.tar.gz
+
+# ---- 构建产物（二进制走 GitHub Release 附件，不进 git）----
+/dist/
+/build/
+
+# ---- 运行时产物 ----
+/downloads/
+*.part
+*.part.state
+.videomoe/
+.output/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---- macOS / exFAT 旁挂文件 ----
+._*
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+
+# ---- 编辑器 ----
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,62 @@
+BiliFetch —— B 站视频下载器
+================================
+
+这个镜像里有三种装法，挑一种：
+
+
+【推荐】拖 .app 进「应用程序」
+--------------------------------
+    把 BiliFetch.app 拖到右边那个 Applications 图标上。
+
+    装完在「应用程序」里就能看到 BiliFetch 的图标，双击打开就是图形界面：
+    粘贴 B 站链接 -> 点「开始下载」-> 下面能看到进度条和日志。
+
+    第一次双击如果提示"无法验证开发者"：
+      右键点 BiliFetch.app -> 打开 -> 再点"打开"
+
+
+装命令行工具（终端里敲 bilifetch）
+--------------------------------
+    双击「安装命令行工具.command」，输管理员密码。
+    装完在终端里直接：
+        bilifetch 'https://www.bilibili.com/bangumi/play/ep1633643'
+
+
+完全不想装
+--------------------------------
+    终端里进「便携版」目录：
+        cd 便携版
+        ./bin/bilifetch --help
+
+
+用 .pkg 装（给习惯 installer 的用户）
+--------------------------------
+    sudo installer -pkg BiliFetch-1.0.0-cli.pkg -target /
+    这个包只装命令行版，且没做公证，会被 Gatekeeper 拦，右键->打开可以放行。
+
+
+Homebrew 装法（最省事，brew 会自动去掉隔离属性）
+--------------------------------
+    brew install --cask bilifetch
+    （cask 文件在 packaging/homebrew/bilifetch.rb，发布前记得更新 url 和 sha256）
+
+
+依赖
+--------------------------------
+    python3   >= 3.7
+    requests          pip3 install requests
+    ffmpeg            brew install ffmpeg
+
+    一条命令：
+        brew install python ffmpeg && pip3 install requests
+
+    图形界面里缺依赖会在日志里写清楚。
+
+
+用法
+--------------------------------
+    图形界面：打开 BiliFetch.app，粘链接，点「开始下载」
+    命令行：
+        bilifetch 'https://www.bilibili.com/bangumi/play/ep1633643'
+        bilifetch BV1xx411c7mD -q 80 -o ~/Videos
+        bilifetch --help

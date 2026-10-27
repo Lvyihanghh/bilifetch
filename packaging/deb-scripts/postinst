@@ -1,0 +1,21 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        if ! command -v python3 >/dev/null 2>&1; then
+            echo "bilifetch: 警告，没有找到 python3"
+        elif ! python3 -c "import requests" >/dev/null 2>&1; then
+            echo "bilifetch: 警告，缺少 python3-requests，请运行: sudo apt install python3-requests"
+        fi
+        if ! command -v ffmpeg >/dev/null 2>&1; then
+            echo "bilifetch: 警告，没有找到 ffmpeg，请运行: sudo apt install ffmpeg"
+        fi
+        echo ""
+        echo "bilifetch 安装完成。用法："
+        echo "  bilifetch 'https://www.bilibili.com/video/BV1xx411c7mD'"
+        echo "  bilifetch --help"
+        ;;
+esac
+
+exit 0

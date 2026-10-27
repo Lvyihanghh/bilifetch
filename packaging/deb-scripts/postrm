@@ -1,0 +1,8 @@
+#!/bin/sh
+# 卸载后清理
+case "$1" in
+    purge)
+        rm -rf /usr/lib/bilifetch
+        ;;
+esac
+exit 0
