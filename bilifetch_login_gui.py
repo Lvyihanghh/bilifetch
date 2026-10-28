@@ -26,7 +26,7 @@ class LoginDialog(QDialog):
         root.setContentsMargins(22, 20, 22, 18)
         root.setSpacing(12)
 
-        tip = QLabel("用手机 B 站 App 扫下方二维码")
+        tip = QLabel("用手机「哔哩哔哩」App 扫下方二维码")
         tip.setAlignment(Qt.AlignCenter)
         tip.setStyleSheet("font-size:14px; font-weight:600; color:#1B1F27;")
         root.addWidget(tip)
@@ -60,6 +60,13 @@ class LoginDialog(QDialog):
             pm = QPixmap()          # loadFromData 返回 bool，得自己建 QPixmap
             if not pm.loadFromData(png):
                 raise RuntimeError("二维码图片解码失败")
+            # 二维码原图有 400 多像素，而标签只有 260pt —— 不缩放的话 QLabel
+            # 会按原尺寸画、然后被裁掉一截，手机扫到的是残缺码（表现为"扫码没反应"）。
+            # 这里按 2x 缩到刚好填满标签，Retina 上也不糊。
+            dpr = 2.0
+            pm = pm.scaled(int(self.qr.width() * dpr), int(self.qr.height() * dpr),
+                           Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            pm.setDevicePixelRatio(dpr)
             self.qr.setPixmap(pm)
             self.status.setText("等待扫码…")
             self._timer.start(2000)
