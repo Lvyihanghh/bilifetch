@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 
 from PyQt5.QtCore import (QEasingCurve, QPoint, QPropertyAnimation, QRect, QRectF, QSize,
                           Qt, QTimer, QObject, QThread, pyqtProperty, pyqtSignal, pyqtSlot)
@@ -947,6 +948,7 @@ class MainWindow(QMainWindow):
         self._set_login_state(dlg.nickname or "已登录")
         self.status_msg.setText("已登录：%s" % (dlg.nickname or ""))
         self.append_log("登录成功：%s（高清画质已解锁）" % (dlg.nickname or ""))
+        self._save_settings()      # 立刻存盘，别等退出时才写（万一中途崩了会丢登录态）
 
     def on_pick_dir(self):
         d = QFileDialog.getExistingDirectory(self, "选择保存目录", self.out_edit.text())
@@ -1031,9 +1033,19 @@ class MainWindow(QMainWindow):
                 self._start_download(url, items=items)
 
     def _start_download(self, url, items=None):
-        out_dir = self.out_edit.text().strip() or os.path.join(
-            os.path.expanduser("~"), "Downloads", "BiliFetch")
-        os.makedirs(out_dir, exist_ok=True)
+        default_dir = os.path.join(os.path.expanduser("~"), "Downloads", "BiliFetch")
+        out_dir = self.out_edit.text().strip() or default_dir
+        # 必须是绝对路径：相对路径会跟着"从 Dock 启动时 CWD=/"这种奇怪状态跑，
+        # 存不进去时下面会直接抛异常。
+        out_dir = os.path.abspath(os.path.expanduser(out_dir))
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except OSError as e:
+            QMessageBox.warning(
+                self, "保存目录不可用",
+                "没法用这个目录：\n%s\n\n(%s)\n\n已经改用 %s" % (out_dir, e, default_dir))
+            out_dir = default_dir
+            os.makedirs(out_dir, exist_ok=True)
         self.out_edit.setText(out_dir)
 
         self.list.clear()
@@ -1203,6 +1215,24 @@ class MainWindow(QMainWindow):
 SELFTEST_RESULT = os.path.join(tempfile.gettempdir(), "bilifetch_selftest.txt")
 
 
+def gui_excepthook(etype, value, tb):
+    """槽里抛了异常时的兜底：弹窗报错，别让程序直接消失。
+
+    PyQt5 的默认行为是 qFatal() -> abort()：一个没接住的异常就会把整个
+    App 打死，用户看到的是"点一下程序就没了"（崩溃报告里是 SIGABRT，
+    栈是 pyqt5_err_print -> QMessageLogger::fatal）。
+    装上自己的 excepthook 就能把它变成一个错误弹窗。
+    """
+    text = "".join(traceback.format_exception(etype, value, tb))
+    sys.stderr.write(text)
+    try:
+        QMessageBox.critical(None, "出错了",
+                             "这一步没能完成：\n%s\n\n（完整信息见终端输出，程序还在运行）"
+                             % value)
+    except Exception:
+        pass
+
+
 def selftest_exit(url, out_dir, wait_ms=4000):
     """打包后的自检：开着界面下到一半就关窗口，看会不会 SIGABRT。
 
@@ -1213,6 +1243,10 @@ def selftest_exit(url, out_dir, wait_ms=4000):
     app.setStyle("Fusion")
     app.setStyleSheet(QSS)
     win = MainWindow()
+    # 自检不能碰用户自己的设置：MainWindow 退出时会 _save_settings()，
+    # 把测试用的输出目录写进用户的 settings.json（曾经因此把用户设置写坏过）
+    win._settings_path = lambda: os.path.join(
+        tempfile.gettempdir(), "bilifetch_selftest_settings.json")
     win.out_edit.setText(out_dir)
     win.show()
     # 万一线程没停下，closeEvent 会弹模态框 —— 自检里不能被它卡住
@@ -1319,6 +1353,7 @@ def main():
     app.setApplicationName("BiliFetch")
     app.setStyle("Fusion")
     app.setStyleSheet(QSS)
+    sys.excepthook = gui_excepthook
     win = MainWindow()
     win.show()
 
