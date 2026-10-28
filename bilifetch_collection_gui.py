@@ -15,6 +15,7 @@ from PyQt5.QtWidgets import (QCheckBox, QDialog, QFrame, QHBoxLayout, QLabel, QL
 
 import bilifetch as core
 import bilifetch_collection as col
+from bilifetch_ui import Card, SectionTitle   # noqa: E402
 
 THUMB_W, THUMB_H = 96, 54
 
@@ -23,7 +24,13 @@ collection_client = None
 
 
 class CoverThread(QThread):
-    """后台批量抓缩略图。抓到的图以 QImage 传回（QPixmap 必须在 GUI 线程里建）。"""
+    """后台批量抓缩略图。
+
+    用线程池并发抓（一张图 ~200ms，串行抓 91 张要等十几秒），
+    抓到的图以 QImage 传回（QPixmap 必须在 GUI 线程里建）。
+    """
+
+    WORKERS = 10
 
     ready = pyqtSignal(int, QImage)
 
@@ -35,21 +42,31 @@ class CoverThread(QThread):
     def stop(self):
         self._stop = True
 
-    def run(self):
+    @staticmethod
+    def _fetch(url):
         import requests
         s = requests.Session()
         s.trust_env = False
         s.headers.update({"User-Agent": "Mozilla/5.0", "Referer": "https://www.bilibili.com/"})
-        for idx, url in self.urls:
-            if self._stop:
-                break
-            try:
-                r = s.get(url, timeout=12)
-                img = QImage()
-                if img.loadFromData(r.content):
-                    self.ready.emit(idx, img)
-            except Exception:
-                pass
+        r = s.get(url, timeout=12)
+        img = QImage()
+        return img if img.loadFromData(r.content) else None
+
+    def run(self):
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        if not self.urls:
+            return
+        with ThreadPoolExecutor(max_workers=self.WORKERS) as pool:
+            futures = {pool.submit(self._fetch, url): idx for idx, url in self.urls}
+            for fut in as_completed(futures):
+                if self._stop:
+                    break
+                try:
+                    img = fut.result()
+                except Exception:
+                    img = None
+                if img is not None:
+                    self.ready.emit(futures[fut], img)
 
 
 class ItemRow(QWidget):
@@ -137,10 +154,8 @@ class CollectionDialog(QDialog):
         root.addLayout(urlrow)
 
         # ---- 顶部：封面 + 名称 ----
-        head = QFrame()
-        head.setObjectName("card")
-        hl = QHBoxLayout(head)
-        hl.setContentsMargins(16, 14, 16, 14)
+        head = Card()
+        hl = head.layout
         hl.setSpacing(14)
         self.cover = QLabel()
         self.cover.setFixedSize(120, 68)
@@ -177,6 +192,9 @@ class CollectionDialog(QDialog):
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(self._filter)
         tools.addWidget(self.search, 1)
+        self.thumb_label = QLabel("")
+        self.thumb_label.setObjectName("hint")
+        tools.addWidget(self.thumb_label)
         self.chk_extra = QCheckBox("含花絮/二创")
         self.chk_extra.setToolTip("番剧除了正片还有 PV、花絮、二创解析等分区")
         self.chk_extra.toggled.connect(self._toggle_extra)
@@ -312,6 +330,15 @@ class CollectionDialog(QDialog):
             self.cover.setStyleSheet("")
         elif idx < len(self.rows):
             self.rows[idx].set_cover(img)
+            self._update_thumb_count()
+
+    def _update_thumb_count(self):
+        """缩略图加载进度提示。"""
+        total = sum(1 for r in self.rows if not r.item.get("extra"))
+        got = sum(1 for r in self.rows
+                  if not r.item.get("extra")
+                  and r.thumb.pixmap() is not None and not r.thumb.pixmap().isNull())
+        self.thumb_label.setText("缩略图 %d/%d" % (got, total) if got < total else "")
 
     # ---------- 选择 ----------
     def _toggle_extra(self, on):

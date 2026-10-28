@@ -45,6 +45,7 @@ copyfile bilifetch_collection.py "$PAYLOAD/lib/bilifetch/bilifetch_collection.py
 copyfile bilifetch_collection_gui.py "$PAYLOAD/lib/bilifetch/bilifetch_collection_gui.py"
 copyfile bilifetch_login.py "$PAYLOAD/lib/bilifetch/bilifetch_login.py"
 copyfile bilifetch_login_gui.py "$PAYLOAD/lib/bilifetch/bilifetch_login_gui.py"
+copyfile bilifetch_ui.py "$PAYLOAD/lib/bilifetch/bilifetch_ui.py"
 copyfile packaging/launcher.sh "$PAYLOAD/bin/bilifetch"
 copyfile README.md "$PAYLOAD/README.md"
 chmod 755 "$PAYLOAD/bin/bilifetch"
@@ -52,7 +53,8 @@ chmod 644 "$PAYLOAD/lib/bilifetch/bilifetch.py" \
           "$PAYLOAD/lib/bilifetch/bilifetch_collection.py" \
           "$PAYLOAD/lib/bilifetch/bilifetch_collection_gui.py" \
           "$PAYLOAD/lib/bilifetch/bilifetch_login.py" \
-          "$PAYLOAD/lib/bilifetch/bilifetch_login_gui.py" "$PAYLOAD/README.md"
+          "$PAYLOAD/lib/bilifetch/bilifetch_login_gui.py" \
+          "$PAYLOAD/lib/bilifetch/bilifetch_ui.py" "$PAYLOAD/README.md"
 
 # ---------------------------------------------------------------- macOS
 if [ "$(uname)" = "Darwin" ]; then
@@ -60,7 +62,7 @@ if [ "$(uname)" = "Darwin" ]; then
     # 图标：橘猫吉祥物（图像模型生成的素材）→ macOS .icns
     ICON="$STAGE/icon.icns"
     if python3 -c "import PIL" >/dev/null 2>&1 && command -v iconutil >/dev/null 2>&1; then
-        python3 packaging/app/make_icon.py "$STAGE" >/dev/null
+        python3 packaging/app/make_icon.py "$STAGE" brand >/dev/null
         sh packaging/app/make_iconset.sh "$STAGE/icon_1024.png" "$ICON" >/dev/null
     else
         echo "    跳过图标（缺 PIL 或 iconutil）"
@@ -169,11 +171,13 @@ if python3 -c "import PyQt5" >/dev/null 2>&1 || [ -f packaging/gui/bilifetch_gui
     cp bilifetch_collection_gui.py "$DEBROOT/usr/lib/bilifetch/bilifetch_collection_gui.py"
     cp bilifetch_login.py "$DEBROOT/usr/lib/bilifetch/bilifetch_login.py"
     cp bilifetch_login_gui.py "$DEBROOT/usr/lib/bilifetch/bilifetch_login_gui.py"
+    cp bilifetch_ui.py "$DEBROOT/usr/lib/bilifetch/bilifetch_ui.py"
     chmod 644 "$DEBROOT/usr/lib/bilifetch/bilifetch_gui.py" \
               "$DEBROOT/usr/lib/bilifetch/bilifetch_collection.py" \
               "$DEBROOT/usr/lib/bilifetch/bilifetch_collection_gui.py" \
               "$DEBROOT/usr/lib/bilifetch/bilifetch_login.py" \
-              "$DEBROOT/usr/lib/bilifetch/bilifetch_login_gui.py"
+              "$DEBROOT/usr/lib/bilifetch/bilifetch_login_gui.py" \
+              "$DEBROOT/usr/lib/bilifetch/bilifetch_ui.py"
     cat > "$DEBROOT/usr/bin/bilifetch-gui" <<'GUI'
 #!/bin/sh
 exec /usr/bin/python3 /usr/lib/bilifetch/bilifetch_gui.py "$@"

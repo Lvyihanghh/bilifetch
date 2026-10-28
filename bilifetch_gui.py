@@ -23,13 +23,16 @@ from PyQt5.QtCore import (QEasingCurve, QPoint, QPropertyAnimation, QRect, QRect
 from PyQt5.QtGui import (QBrush, QColor, QFont, QFontMetrics, QIcon, QLinearGradient, QPainter,
                          QPainterPath, QPen, QPixmap)
 from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame,
-                             QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLineEdit,
+                             QHBoxLayout, QLabel, QLineEdit,
                              QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
                              QPlainTextEdit, QPushButton, QSizePolicy, QStatusBar,
                              QVBoxLayout, QWidget)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bilifetch as core          # noqa: E402
+from bilifetch_ui import (BLUE, BLUE_D, CARD, DARK, DARK_FG, INK, INK_2, INK_3,
+                        LINE, PAGE, PINK, PINK_D, TRACK, Card, IconLabel,
+                        SectionTitle, draw_fox, fade_in, make_icon)   # noqa: E402
 import bilifetch_collection as collection        # noqa: E402
 import bilifetch_collection_gui as collection_gui     # noqa: E402
 import bilifetch_login as login_mod                    # noqa: E402
@@ -39,19 +42,6 @@ from bilifetch_collection_gui import CollectionDialog   # noqa: E402
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # ---------------------------------------------------------------- 设计变量
-PINK = "#FB7299"
-PINK_D = "#F0628B"
-BLUE = "#23ADE5"
-BLUE_D = "#1C96CC"
-INK = "#1B1F27"        # 主文字
-INK_2 = "#5B6373"      # 次文字
-INK_3 = "#9AA2B2"      # 弱文字
-PAGE = "#F4F6FA"       # 页面底色
-CARD = "#FFFFFF"
-LINE = "#E7EBF3"
-TRACK = "#EDF0F6"
-DARK = "#121722"       # 日志面板
-DARK_FG = "#B7C2D6"
 
 QUALITY_CHOICES = [
     ("最高可得", 0),
@@ -69,11 +59,6 @@ QSS = """
 QWidget { color: %INK%; }
 QMainWindow, QDialog { background: %PAGE%; }
 
-QFrame#card {
-    background: %CARD%;
-    border: 1px solid %LINE%;
-    border-radius: 16px;
-}
 QFrame#panelDark {
     background: %DARK%;
     border: none;
@@ -161,7 +146,7 @@ QListWidget { background: transparent; border: none; outline: none; }
 QListWidget::item { border: none; }
 
 QPlainTextEdit {
-    background: %DARK%;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #1B2231, stop:1 %DARK%);
     color: %DARK_FG%;
     border: none;
     border-radius: 12px;
@@ -188,123 +173,87 @@ for _k, _v in {"INK": INK, "INK_2": INK_2, "INK_3": INK_3, "PAGE": PAGE, "CARD":
 
 
 # ---------------------------------------------------------------- 小图标
-def make_icon(kind, color, size=16):
-    """用 QPainter 画几个简单图标，省得引 SVG 资源。"""
-    pm = QPixmap(size, size)
-    pm.fill(Qt.transparent)
-    p = QPainter(pm)
-    p.setRenderHint(QPainter.Antialiasing)
-    pen = QPen(QColor(color))
-    pen.setWidthF(1.6)
-    pen.setCapStyle(Qt.RoundCap)
-    pen.setJoinStyle(Qt.RoundJoin)
-    p.setPen(pen)
-    s = size / 16.0
-    if kind == "folder":
-        p.drawPath(QPainterPath())  # 占位，下面用折线画
-        p.drawLine(int(2 * s), int(5 * s), int(7 * s), int(5 * s))
-        p.drawLine(int(7 * s), int(5 * s), int(8.5 * s), int(7 * s))
-        p.drawLine(int(8.5 * s), int(7 * s), int(14 * s), int(7 * s))
-        p.drawLine(int(14 * s), int(7 * s), int(12 * s), int(12.5 * s))
-        p.drawLine(int(12 * s), int(12.5 * s), int(4 * s), int(12.5 * s))
-        p.drawLine(int(4 * s), int(12.5 * s), int(2 * s), int(5 * s))
-    elif kind == "film":
-        p.drawRoundedRect(QRectF(2 * s, 3.5 * s, 12 * s, 9 * s), 1.6 * s, 1.6 * s)
-        for i in (5, 9):
-            p.drawPoint(int(i * s), int(5.2 * s))
-            p.drawPoint(int(i * s), int(10.8 * s))
-    elif kind == "play":
-        path = QPainterPath()
-        path.moveTo(6 * s, 4.5 * s)
-        path.lineTo(12 * s, 8 * s)
-        path.lineTo(6 * s, 11.5 * s)
-        path.closeSubpath()
-        p.setBrush(QColor(color))
-        p.drawPath(path)
-    elif kind == "stop":
-        p.setBrush(QColor(color))
-        p.drawRoundedRect(QRectF(4.5 * s, 4.5 * s, 7 * s, 7 * s), 1.4 * s, 1.4 * s)
-    elif kind == "trash":
-        p.drawLine(int(3 * s), int(5 * s), int(13 * s), int(5 * s))
-        p.drawLine(int(6 * s), int(3 * s), int(10 * s), int(3 * s))
-        p.drawRoundedRect(QRectF(4.5 * s, 5 * s, 7 * s, 8 * s), 1.2 * s, 1.2 * s)
-    elif kind == "copy":
-        p.drawRoundedRect(QRectF(5.5 * s, 5.5 * s, 8 * s, 8 * s), 1.4 * s, 1.4 * s)
-        p.drawPolyline([QPoint(int(3.5 * s), int(10.5 * s)), QPoint(int(3.5 * s), int(3.5 * s)),
-                        QPoint(int(10.5 * s), int(3.5 * s))])
-    elif kind == "gear":
-        p.drawEllipse(QRectF(5.5 * s, 5.5 * s, 5 * s, 5 * s))
-    p.end()
-    return pm
 
 
 def load_app_icon():
-    """尽量找到 App 图标（打包后或源码运行时）。"""
-    cands = [
-        os.path.join(HERE, "packaging", "app", "icon_source.png"),
-        os.path.join(HERE, "icon.png"),
-        os.path.join(os.path.dirname(sys.executable), "..", "Resources", "icon.icns"),
-    ]
-    for c in cands:
+    """窗口图标：优先用打包好的 .icns；源码运行时现画一只矢量狐狸。"""
+    for c in (os.path.join(os.path.dirname(sys.executable), "..", "Resources", "icon.icns"),
+              os.path.join(HERE, "packaging", "app", "icon_1024.png")):
         c = os.path.normpath(c)
         if os.path.exists(c):
             return QIcon(c)
-    return QIcon()
+    pm = QPixmap(128, 128)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    draw_fox(p, 14, 14, 100)
+    p.end()
+    return QIcon(pm)
 
 
 # ---------------------------------------------------------------- 组件
-class Card(QFrame):
-    """白色圆角卡片。"""
+
+
+
+
+class EmptyArt(QWidget):
+    """空状态的小插画：圆角徽章 + 下载箭头。"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setObjectName("card")
-        self.layout = QVBoxLayout(self)
-        self.layout.setContentsMargins(20, 18, 20, 18)
-        self.layout.setSpacing(12)
+        self.setFixedSize(64, 64)
 
-    def add_title(self, text):
-        t = SectionTitle(text)
-        self.layout.addWidget(t)
-        return t
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = QRectF(self.rect()).adjusted(5, 5, -5, -5)
+        u = r.width() / 84.0          # 以 96px 画布为基准等比缩放
+        grad = QLinearGradient(r.topLeft(), r.bottomRight())
+        grad.setColorAt(0, QColor(255, 234, 242))
+        grad.setColorAt(1, QColor(222, 243, 253))
+        p.setBrush(QBrush(grad))
+        p.setPen(Qt.NoPen)
+        p.drawRoundedRect(r, 26 * u, 26 * u)
+        cx, cy = r.center().x(), r.center().y()
+        pen = QPen(QColor(255, 122, 158))
+        pen.setWidthF(4.2 * u)
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        p.drawLine(int(cx), int(cy - 16 * u), int(cx), int(cy + 8 * u))
+        p.drawPolyline([QPoint(int(cx - 9 * u), int(cy - 1 * u)),
+                        QPoint(int(cx), int(cy + 9 * u)),
+                        QPoint(int(cx + 9 * u), int(cy - 1 * u))])
+        p.drawLine(int(cx - 15 * u), int(cy + 17 * u), int(cx + 15 * u), int(cy + 17 * u))
+        p.end()
 
 
-class SectionTitle(QWidget):
-    """带小色条的分区标题。"""
+class LogoTile(QWidget):
+    """标题栏的小徽章：圆角渐变底 + 狐狸。"""
 
-    def __init__(self, text, parent=None):
+    def __init__(self, size=46, parent=None):
         super().__init__(parent)
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(8)
-        bar = QLabel()
-        bar.setFixedSize(3, 13)
-        bar.setStyleSheet("background: qlineargradient(x1:0,y1:0,x2:1,y2:0,"
-                          "stop:0 %s, stop:1 %s); border-radius: 1px;" % (PINK, BLUE))
-        lbl = QLabel(text)
-        lbl.setObjectName("secTitle")
-        lay.addWidget(bar)
-        lay.addWidget(lbl)
-        lay.addStretch(1)
+        self.setFixedSize(size, size)
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = self.rect()
+        rad = r.width() * 0.26
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(r), rad, rad)
+        grad = QLinearGradient(r.topLeft(), r.bottomRight())
+        grad.setColorAt(0, QColor(255, 233, 241))
+        grad.setColorAt(1, QColor(219, 242, 253))
+        p.fillPath(path, QBrush(grad))
+        p.setClipPath(path)
+        # 狐狸：纯矢量绘制，不依赖任何图片资源（打包后路径会变）
+        m = r.width() * 0.86
+        draw_fox(p, (r.width() - m) / 2, (r.height() - m) / 2 + r.height() * 0.03, m)
+        p.end()
 
 
-class IconLabel(QWidget):
-    """图标 + 文字的小标签。"""
-
-    def __init__(self, text, icon_kind=None, color=INK_3, parent=None):
-        super().__init__(parent)
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(6)
-        if icon_kind:
-            ic = QLabel()
-            ic.setPixmap(make_icon(icon_kind, color, 15))
-            ic.setFixedWidth(15)
-            lay.addWidget(ic)
-        self.label = QLabel(text)
-        self.label.setObjectName("fieldLbl")
-        lay.addWidget(self.label)
-        lay.addStretch(1)
 
 
 class FloatButton(QPushButton):
@@ -412,16 +361,25 @@ class FloatButton(QPushButton):
 
 
 class SlimBar(QWidget):
-    """自绘进度条：圆角轨道 + 粉蓝渐变，带平滑过渡。"""
+    """自绘进度条：圆角轨道 + 粉蓝渐变，带平滑过渡和一道流光。"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._value = 0.0
+        self._shine = 0.0
         self.setFixedHeight(6)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._anim = QPropertyAnimation(self, b"value", self)
         self._anim.setDuration(260)
         self._anim.setEasingCurve(QEasingCurve.OutCubic)
+        # 流光：一道柔和高光缓慢扫过进度条
+        self._shine_timer = QTimer(self)
+        self._shine_timer.timeout.connect(self._tick_shine)
+        self._shine_timer.start(40)
+
+    def _tick_shine(self):
+        self._shine = (self._shine + 0.02) % 1.0
+        self.update()
 
     def _get(self):
         return self._value
@@ -459,6 +417,16 @@ class SlimBar(QWidget):
             p.setBrush(QBrush(grad))
             p.drawRoundedRect(QRectF(0, 0, w, self.height()),
                               self.height() / 2.0, self.height() / 2.0)
+            # 流光
+            if self._value < 99.5:
+                cx = self._shine * (w + 40) - 20
+                sh = QLinearGradient(cx - 18, 0, cx + 18, 0)
+                sh.setColorAt(0.0, QColor(255, 255, 255, 0))
+                sh.setColorAt(0.5, QColor(255, 255, 255, 90))
+                sh.setColorAt(1.0, QColor(255, 255, 255, 0))
+                p.setBrush(QBrush(sh))
+                p.drawRoundedRect(QRectF(0, 0, w, self.height()),
+                                  self.height() / 2.0, self.height() / 2.0)
         p.end()
 
 
@@ -725,9 +693,7 @@ class MainWindow(QMainWindow):
         # ---- 标题区 ----
         head = QHBoxLayout()
         head.setSpacing(13)
-        logo = QLabel()
-        logo.setPixmap(load_app_icon().pixmap(46, 46))
-        logo.setFixedSize(46, 46)
+        logo = LogoTile(46)
         titles = QVBoxLayout()
         titles.setSpacing(2)
         t = QLabel("BiliFetch")
@@ -848,13 +814,23 @@ class MainWindow(QMainWindow):
 
         self.list = QListWidget()
         self.list.setMinimumHeight(110)
-        self.empty_hint = QLabel("还没有任务 —— 把 B 站链接粘到上面，点「浏览…」挑选内容")
-        self.empty_hint.setObjectName("hint")
-        self.empty_hint.setAlignment(Qt.AlignCenter)
+        self.empty_hint = QWidget()
+        eh = QVBoxLayout(self.empty_hint)
+        eh.setContentsMargins(0, 4, 0, 6)
+        eh.setSpacing(8)
+        art = EmptyArt()
+        eh.addWidget(art, 0, Qt.AlignHCenter)
+        tip = QLabel("还没有任务 —— 把 B 站链接粘到上面，点「浏览…」挑选内容")
+        tip.setObjectName("hint")
+        tip.setAlignment(Qt.AlignCenter)
+        eh.addWidget(tip)
         qcard.layout.addWidget(self.empty_hint)
         qcard.layout.addWidget(self.list, 1)
         self.list.setVisible(False)
-        root.addWidget(qcard, 1)
+        # 空状态是竖排的（插画在上、文字在下），卡片给够高度，
+        # 否则窗口一矮，Qt 会把两个控件压到重叠
+        qcard.setMinimumHeight(196)
+        root.addWidget(qcard, 3)
         self.card_queue = qcard
 
         # ---- 日志卡 ----
@@ -879,10 +855,15 @@ class MainWindow(QMainWindow):
         self.log_view.setMinimumHeight(108)
         self.log_view.setMaximumBlockCount(3000)
         lcard.layout.addWidget(self.log_view, 1)
-        root.addWidget(lcard, 1)
+        root.addWidget(lcard, 2)
         self.card_log = lcard
 
         self.setCentralWidget(central)
+
+        # 窗口最小尺寸交给布局算：内容挤不下时 Qt 会把控件压到重叠
+        need_h = root.minimumSize().height()
+        self.setMinimumSize(920, max(660, need_h + 6))
+        self.resize(980, max(800, need_h + 60))
 
         sb = QStatusBar()
         self.setStatusBar(sb)
@@ -910,9 +891,9 @@ class MainWindow(QMainWindow):
     def _play_intro(self):
         """入场：窗口渐显 + 各卡片错开淡入。
 
-        注意：不要给 centralWidget 套 QGraphicsOpacityEffect ——
-        卡片自己也有 effect，嵌套 effect 会让 Qt 报
-        "A paint device can only be painted by one painter at a time"。
+        淡入走 bilifetch_ui.fade_in（自己盖半透明遮罩），
+        不用 QGraphicsOpacityEffect —— 那东西和自绘控件的 QPainter
+        会抢同一个绘制设备，界面会画花。
         整窗渐显用 windowOpacity 就够了（顶层窗口专有属性）。
         """
         self.setWindowOpacity(0.0)
@@ -929,17 +910,7 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(60 + i * 70, lambda c=card: self._fade_in(c))
 
     def _fade_in(self, widget):
-        if widget.graphicsEffect() is not None:
-            return
-        eff = QGraphicsOpacityEffect(widget)
-        widget.setGraphicsEffect(eff)
-        anim = QPropertyAnimation(eff, b"opacity", self)
-        anim.setDuration(280)
-        anim.setStartValue(0.0)
-        anim.setEndValue(1.0)
-        anim.setEasingCurve(QEasingCurve.OutCubic)
-        anim.start()
-        self._anims.append(anim)
+        fade_in(widget, 280, PAGE)
 
     def _toggle_adv(self, on):
         if on:
@@ -1203,12 +1174,25 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._save_settings()
+        if not self._stop_worker():
+            QMessageBox.information(self, "正在退出", "下载线程还没停下来，请稍后再关一次。")
+            event.ignore()
+            return
+        event.accept()
+
+    def _stop_worker(self):
+        """取消下载并等后台线程收尾。返回 True 表示已经干净停下。
+
+        QThread 在运行中被销毁会让 Qt 直接 abort（SIGABRT，崩溃弹窗），
+        所以这里必须等到线程真的结束。
+        """
         if self.worker:
             self.worker.cancel()
         if self.thread and self.thread.isRunning():
-            # 等后台线程把当前分段收尾（分片循环里会检查取消标志）
-            self.thread.wait(2500)
-        event.accept()
+            self.thread.quit()
+            if not self.thread.wait(15000):
+                return False
+        return True
 
 
 SELFTEST_RESULT = os.path.join(tempfile.gettempdir(), "bilifetch_selftest.txt")
@@ -1286,11 +1270,9 @@ def main():
     win.show()
 
     def shutdown():
-        # ⌘Q 退出不会触发窗口的 closeEvent，这里补上取消 + 等后台线程收尾
-        if win.worker:
-            win.worker.cancel()
-        if win.thread and win.thread.isRunning():
-            win.thread.wait(2500)
+        # ⌘Q 退出不会触发窗口的 closeEvent，这里补上取消 + 等线程收尾
+        # （不等的话 QThread 会在运行中被销毁 → Qt abort → 崩溃弹窗）
+        win._stop_worker()
 
     app.aboutToQuit.connect(shutdown)
     sys.exit(app.exec_())

@@ -7,8 +7,9 @@ Linux 下是 `.deb`（图形界面用系统的 python3-pyqt5）。
 
 ![界面](docs/screenshot.png)
 
-> 图标是用图像模型生成的橘猫吉祥物（抱着下载箭头），素材存在
-> `packaging/app/icon_source.png`，打包时由 `packaging/app/make_icon.py` 切成 macOS 的 `.icns`。
+> 图标是用图像模型生成的简约小狐狸（扁平风），素材存在
+> `packaging/app/fox_source.png`，打包时由 `packaging/app/make_icon.py` 合成 macOS 的 `.icns`；
+> 界面里那只狐狸是同一只，用矢量代码现画（`bilifetch_ui.py` 的 `draw_fox`），任何尺寸都清晰。
 
 ---
 
@@ -404,5 +405,5 @@ packaging/
 ### 商标
 
 本项目与哔哩哔哩（Bilibili）无任何隶属关系；"Bilibili" 相关名称与标识归其权利人所有。
-本项目图标为原创生成的橘猫形象，**未使用** B 站官方 logo 或吉祥物形象。
+本项目图标为原创生成的狐狸形象，**未使用** B 站官方 logo 或吉祥物形象。
 

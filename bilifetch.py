@@ -316,7 +316,7 @@ class BiliClient:
         if isinstance(urls, str):
             urls = [urls]
         urls = self._expand_candidates(urls, cdn)
-        best = self._fastest_cdn(urls, referer)
+        best = self._fastest_cdn(urls, referer, should_stop=should_stop)
         order = ([best] if best else []) + [u for u in urls if u != best]
         last_err = None
         for url in order:
@@ -348,16 +348,24 @@ class BiliClient:
                 out.append(u)
         return out
 
-    def _fastest_cdn(self, urls, referer):
-        """每个候选地址探一次速，挑最快的；够快就不再探。"""
+    def _fastest_cdn(self, urls, referer, should_stop=None):
+        """每个候选地址探一次速，挑最快的；够快就不再探。
+
+        每次只探 128KB —— 探速只是要个相对快慢，用不着下几百 KB；
+        而且探速阶段也要能响应取消，否则"停止"要等十几秒才生效。
+        """
         best, best_speed = None, 0.0
         for u in urls:
+            if should_stop and should_stop():
+                raise Cancelled()
             try:
                 t = time.time()
-                resp = self.session.get(u, headers=self._range_headers(referer, 0, 512 * 1024),
-                                        stream=True, timeout=(5, 12))
+                resp = self.session.get(u, headers=self._range_headers(referer, 0, 128 * 1024),
+                                        stream=True, timeout=(5, 10))
                 n = sum(len(c) for c in resp.iter_content(1 << 16))
                 resp.close()
+            except Cancelled:
+                raise
             except Exception:
                 continue
             speed = n / max(time.time() - t, 0.01)
