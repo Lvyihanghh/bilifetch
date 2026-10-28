@@ -102,7 +102,7 @@ python3 bilifetch_gui.py        # 图形界面
 
 ![扫码登录](docs/screenshot-login.png)
 
-**高级 → 扫码登录** → 用手机 B 站 App 扫二维码 → 手机上确认 → 自动登录成功。
+**右上角「扫码登录 · 解锁 1080P」** → 用手机 B 站 App 扫二维码 → 手机上确认 → 自动登录成功。
 
 - 二维码有效期 **180 秒**，过期了点「刷新二维码」
 - 登录态保存在 `~/Library/Application Support/BiliFetch/settings.json`（Linux 是 `~/.config/bilifetch/`），
@@ -329,6 +329,13 @@ BiliFetch.app/Contents/MacOS/BiliFetch --selftest <链接> <输出目录>
 
 它会不开界面真下一次，把结果写到 `~/.bilifetch_selftest.txt` ——
 **PyInstaller 打包最容易在 SSL 证书、隐藏依赖上翻车**，所以必须真跑一次。
+
+还有一条查「下载中退出会不会崩」的（QThread 在运行中被析构会让 Qt 直接 abort）：
+
+```bash
+BiliFetch.app/Contents/MacOS/BiliFetch --selftest-exit <链接> <输出目录>
+# OK 下载中关窗口，线程干净收尾
+```
 
 打包脚本的三个坑（已在 `build.sh` 里处理）：
 

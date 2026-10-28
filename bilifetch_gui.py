@@ -786,13 +786,12 @@ class MainWindow(QMainWindow):
         av.addWidget(self.cookie_edit, 1)
         av.addWidget(IconLabel("代理", "gear"))
         av.addWidget(self.proxy_edit, 0)
-        av.addWidget(IconLabel("Cookie", "gear"))
         self.adv_card.layout.addLayout(av)
         self.adv_card.setVisible(False)
         self.chk_adv = QCheckBox("显示高级设置（扫码登录 / Cookie / 代理）")
         self.chk_adv.setCursor(Qt.PointingHandCursor)
         self.chk_adv.toggled.connect(self._toggle_adv)
-        root.addWidget(self.chk_adv)
+        card.layout.addWidget(self.chk_adv)   # 放进选项卡里，别孤零零飘在页面上
         root.addWidget(self.adv_card)
 
         # ---- 队列卡 ----
@@ -864,6 +863,7 @@ class MainWindow(QMainWindow):
         need_h = root.minimumSize().height()
         self.setMinimumSize(920, max(660, need_h + 6))
         self.resize(980, max(800, need_h + 60))
+        self._compact_h = self.height()      # 高级卡收起时的高度
 
         sb = QStatusBar()
         self.setStatusBar(sb)
@@ -913,11 +913,16 @@ class MainWindow(QMainWindow):
         fade_in(widget, 280, PAGE)
 
     def _toggle_adv(self, on):
+        self.adv_card.setVisible(on)
         if on:
-            self.adv_card.setVisible(True)
             self._fade_in(self.adv_card)
+        # 高级卡一进一出，布局所需高度就变了；窗口跟着长/缩，
+        # 不然下面的卡片会被压到互相重叠。
+        need = self.centralWidget().layout().minimumSize().height() + 60
+        if on:
+            self.resize(self.width(), max(self.height(), need))
         else:
-            self.adv_card.setVisible(False)
+            self.resize(self.width(), max(need, self._compact_h))
 
     # ---------------- 事件 ----------------
     def _set_login_state(self, nickname):
@@ -1198,6 +1203,51 @@ class MainWindow(QMainWindow):
 SELFTEST_RESULT = os.path.join(tempfile.gettempdir(), "bilifetch_selftest.txt")
 
 
+def selftest_exit(url, out_dir, wait_ms=4000):
+    """打包后的自检：开着界面下到一半就关窗口，看会不会 SIGABRT。
+
+    QThread 在运行中被销毁会让 Qt 直接 abort（进程退出码 134），
+    所以这条自检能直接回答"下载中退出到底崩不崩"。
+    """
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    app.setStyleSheet(QSS)
+    win = MainWindow()
+    win.out_edit.setText(out_dir)
+    win.show()
+    # 万一线程没停下，closeEvent 会弹模态框 —— 自检里不能被它卡住
+    QMessageBox.information = staticmethod(lambda *a, **k: None)
+
+    QTimer.singleShot(1200, lambda: win._start_download(url))
+
+    state = {"running": True, "downloading": False}
+
+    def bye():
+        # 关之前先确认线程真的在跑（不然这条自检就是空跑）
+        state["downloading"] = bool(win.thread and win.thread.isRunning())
+        win.close()                       # 走 closeEvent -> _stop_worker
+        state["running"] = bool(win.thread and win.thread.isRunning())
+
+    QTimer.singleShot(wait_ms, bye)
+    QTimer.singleShot(wait_ms + 30000, app.quit)
+    app.exec_()
+
+    ok = state["downloading"] and not state["running"]
+    if not state["downloading"]:
+        text = "FAIL 下载根本没开始，这条自检不算数\n"
+    elif state["running"]:
+        text = "FAIL 退出时线程还在跑\n"
+    else:
+        text = "OK 下载中关窗口，线程干净收尾\n"
+    try:
+        with open(SELFTEST_RESULT, "w", encoding="utf-8") as fp:
+            fp.write(text)
+    except OSError:
+        pass
+    print(text.strip())
+    return 0 if ok else 1
+
+
 def selftest(url, out_dir):
     """打包后的自检：不开界面，真下一次，把结果写到文件里。
 
@@ -1261,6 +1311,9 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--selftest-collection":
         out_dir = sys.argv[3] if len(sys.argv) > 3 else os.path.expanduser("~/Downloads")
         sys.exit(selftest_collection(sys.argv[2], out_dir))
+    if len(sys.argv) > 1 and sys.argv[1] == "--selftest-exit":
+        out_dir = sys.argv[3] if len(sys.argv) > 3 else tempfile.gettempdir()
+        sys.exit(selftest_exit(sys.argv[2], out_dir))
 
     app = QApplication(sys.argv)
     app.setApplicationName("BiliFetch")
