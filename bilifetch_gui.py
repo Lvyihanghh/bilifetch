@@ -26,8 +26,8 @@ from PyQt5.QtGui import (QBrush, QColor, QFont, QFontMetrics, QIcon, QLinearGrad
 from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame,
                              QHBoxLayout, QLabel, QLineEdit,
                              QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
-                             QPlainTextEdit, QPushButton, QSizePolicy, QStatusBar,
-                             QVBoxLayout, QWidget)
+                             QPlainTextEdit, QPushButton, QSizePolicy, QStackedWidget,
+                             QStatusBar, QVBoxLayout, QWidget)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bilifetch as core          # noqa: E402
@@ -273,6 +273,7 @@ class FloatButton(QPushButton):
         self.kind = kind
         self._lift = 0.0
         self._icon = None
+        self._active = True
         self.setCursor(Qt.PointingHandCursor)
         self.setFixedHeight(38)
         self._anim = QPropertyAnimation(self, b"lift", self)
@@ -283,6 +284,11 @@ class FloatButton(QPushButton):
         """给按钮配一个小图标（自绘时一起画）。"""
         self._icon = make_icon(kind, color, size)
         self.updateGeometry()
+
+    def setActive(self, on):
+        """分段按钮用：选中的是白药丸，没选中的是透明。"""
+        self._active = on
+        self.update()
 
     def _get_lift(self):
         return self._lift
@@ -341,6 +347,17 @@ class FloatButton(QPushButton):
             path.addRoundedRect(QRectF(r).adjusted(0, lift, 0, -lift), 11, 11)
             p.drawPath(path)
             text_color = QColor(INK_2)
+        if self.kind == "tab":
+            # 分段按钮：选中的画成白药丸，没选中的留空
+            path = QPainterPath()
+            if self._active:
+                p.setBrush(QColor("#ffffff"))
+                p.setPen(Qt.NoPen)
+                path.addRoundedRect(QRectF(r).adjusted(2, lift, -2, -lift), 9, 9)
+                p.drawPath(path)
+                text_color = QColor(INK)
+            else:
+                text_color = QColor(INK_3)
         p.setPen(QPen(text_color))
         f = self.font()
         f.setWeight(QFont.DemiBold)
@@ -855,12 +872,29 @@ class MainWindow(QMainWindow):
         self.adv_card.setVisible(False)
         root.addWidget(self.adv_card)
 
-        # ---- 队列卡 ----
+        # ---- 队列 / 日志：同一张卡，分段切换 ----
+        # 之前是两张卡各占一半高度，日志那块大部分时间是个空黑框，看着像没做完。
         qcard = Card()
         qhead = QHBoxLayout()
-        qhead.setSpacing(10)
-        qtitle = SectionTitle("下载队列")
-        qhead.addWidget(qtitle, 1)
+        qhead.setSpacing(8)
+
+        track = QWidget()
+        track.setFixedHeight(34)
+        track.setStyleSheet("background:#F1F4F9; border-radius:10px;")
+        tlay = QHBoxLayout(track)
+        tlay.setContentsMargins(3, 3, 3, 3)
+        tlay.setSpacing(2)
+        self.tab_queue = FloatButton("下载队列", "tab")
+        self.tab_log = FloatButton("运行日志", "tab")
+        for b in (self.tab_queue, self.tab_log):
+            b.setFixedHeight(28)
+            b.setCursor(Qt.PointingHandCursor)
+            tlay.addWidget(b)
+        self.tab_queue.clicked.connect(lambda: self._switch_tab(True))
+        self.tab_log.clicked.connect(lambda: self._switch_tab(False))
+        qhead.addWidget(track)
+        qhead.addStretch(1)
+
         self.btn_stop = FloatButton("停止", "ghost")
         self.btn_stop.setGlyph("stop", INK_2, 13)
         self.btn_stop.setFixedWidth(84)
@@ -868,37 +902,6 @@ class MainWindow(QMainWindow):
         self.btn_clear = FloatButton("清空", "ghost")
         self.btn_clear.setFixedWidth(74)
         self.btn_clear.clicked.connect(self.on_clear)
-        qhead.addWidget(self.btn_stop)
-        qhead.addWidget(self.btn_clear)
-        qcard.layout.addLayout(qhead)
-
-        self.list = QListWidget()
-        self.list.setMinimumHeight(110)
-        self.empty_hint = QWidget()
-        eh = QVBoxLayout(self.empty_hint)
-        eh.setContentsMargins(0, 4, 0, 6)
-        eh.setSpacing(8)
-        art = EmptyArt()
-        eh.addWidget(art, 0, Qt.AlignHCenter)
-        tip = QLabel("还没有任务 —— 把 B 站链接粘到上面，点「浏览…」挑选内容")
-        tip.setObjectName("hint")
-        tip.setAlignment(Qt.AlignCenter)
-        eh.addWidget(tip)
-        qcard.layout.addWidget(self.empty_hint)
-        qcard.layout.addWidget(self.list, 1)
-        self.list.setVisible(False)
-        # 空状态是竖排的（插画在上、文字在下），卡片给够高度，
-        # 否则窗口一矮，Qt 会把两个控件压到重叠
-        qcard.setMinimumHeight(196)
-        root.addWidget(qcard, 3)
-        self.card_queue = qcard
-
-        # ---- 日志卡 ----
-        lcard = Card()
-        lhead = QHBoxLayout()
-        lhead.setSpacing(10)
-        ltitle = SectionTitle("运行日志")
-        lhead.addWidget(ltitle, 1)
         self.btn_copy = FloatButton("复制", "ghost")
         self.btn_copy.setGlyph("copy", INK_2, 13)
         self.btn_copy.setFixedWidth(66)
@@ -907,16 +910,54 @@ class MainWindow(QMainWindow):
         self.btn_logclear.setGlyph("trash", INK_2, 13)
         self.btn_logclear.setFixedWidth(66)
         self.btn_logclear.clicked.connect(self.on_clear_log)
-        lhead.addWidget(self.btn_copy)
-        lhead.addWidget(self.btn_logclear)
-        lcard.layout.addLayout(lhead)
+        for b in (self.btn_stop, self.btn_clear, self.btn_copy, self.btn_logclear):
+            qhead.addWidget(b)
+        qcard.layout.addLayout(qhead)
+
+        self.stack = QStackedWidget()
+
+        # 队列页
+        page_q = QWidget()
+        ql = QVBoxLayout(page_q)
+        ql.setContentsMargins(0, 0, 0, 0)
+        ql.setSpacing(8)
+        self.list = QListWidget()
+        self.list.setMinimumHeight(110)
+        self.empty_hint = QWidget()
+        eh = QVBoxLayout(self.empty_hint)
+        eh.setContentsMargins(0, 4, 0, 6)
+        eh.setSpacing(8)
+        eh.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)   # 插画和文字整体居中
+        art = EmptyArt()
+        eh.addWidget(art, 0, Qt.AlignHCenter)
+        tip = QLabel("还没有任务 —— 把 B 站链接粘到上面，点「浏览…」挑选内容")
+        tip.setObjectName("hint")
+        tip.setAlignment(Qt.AlignCenter)
+        eh.addWidget(tip)
+        ql.addWidget(self.empty_hint)
+        ql.addWidget(self.list, 1)
+        self.list.setVisible(False)
+        self.stack.addWidget(page_q)
+
+        # 日志页
+        page_l = QWidget()
+        ll = QVBoxLayout(page_l)
+        ll.setContentsMargins(0, 0, 0, 0)
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setMinimumHeight(108)
         self.log_view.setMaximumBlockCount(3000)
-        lcard.layout.addWidget(self.log_view, 1)
-        root.addWidget(lcard, 2)
-        self.card_log = lcard
+        ll.addWidget(self.log_view, 1)
+        self.stack.addWidget(page_l)
+
+        qcard.layout.addWidget(self.stack, 1)
+        # 空状态是竖排的（插画在上、文字在下），卡片给够高度，
+        # 否则窗口一矮，Qt 会把两个控件压到重叠
+        qcard.setMinimumHeight(240)
+        root.addWidget(qcard, 1)
+        self.card_queue = qcard
+        self.card_log = qcard
+        self._switch_tab(True)
 
         self.setCentralWidget(central)
 
@@ -966,11 +1007,22 @@ class MainWindow(QMainWindow):
         anim.start()
         self._anims.append(anim)
 
-        for i, card in enumerate((self.card_link, self.card_queue, self.card_log)):
+        for i, card in enumerate((self.card_link, self.card_queue)):
             QTimer.singleShot(60 + i * 70, lambda c=card: self._fade_in(c))
 
     def _fade_in(self, widget):
         fade_in(widget, 280, PAGE)
+
+    def _switch_tab(self, show_queue):
+        """队列 / 日志 两个分段。"""
+        self.stack.setCurrentIndex(0 if show_queue else 1)
+        self.tab_queue.setActive(show_queue)
+        self.tab_log.setActive(not show_queue)
+        self.btn_stop.setVisible(show_queue)
+        self.btn_clear.setVisible(show_queue)
+        self.btn_stop.setEnabled(bool(self.worker))      # 没任务时「停止」是灰的
+        self.btn_copy.setVisible(not show_queue)
+        self.btn_logclear.setVisible(not show_queue)
 
     def _toggle_adv(self):
         """齿轮按钮：展开/收起高级设置。"""
@@ -1147,6 +1199,7 @@ class MainWindow(QMainWindow):
         self.empty_hint.setVisible(False)
         self.btn_start.setEnabled(False)
         self.btn_start.setText("下载中…")
+        self.btn_stop.setEnabled(True)
         self.dot.setVisible(True)
         self.status_msg.setText("下载中…")
 
