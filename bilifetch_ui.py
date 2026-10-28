@@ -167,6 +167,9 @@ def fade_in(widget, duration=280, color=PAGE):
         state["i"] += 1
         t = min(1.0, state["i"] / n)
         e = 1.0 - (1.0 - t) ** 3          # OutCubic，和其它动画一致
+        # 目标控件可能还没布局完（刚加进列表的行），
+        # 遮罩要每帧跟着目标尺寸走，不然会盖错地方
+        ov.setGeometry(widget.rect())
         ov.set_alpha(255 * (1.0 - e))
         if state["i"] >= n:
             timer.stop()

@@ -72,6 +72,14 @@ QLabel#fieldLbl { font-size: 12px; color: %INK_2%; }
 QLabel#rowTitle { font-size: 13px; color: %INK%; }
 QLabel#rowMeta  { font-size: 11px; color: %INK_3%; }
 QLabel#hint     { font-size: 12px; color: %INK_3%; }
+QLabel#loginChip {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #FDECF2, stop:1 #E4F4FC);
+    color: %INK_2%;
+    border-radius: 15px;
+    padding: 7px 14px;
+    font-size: 12px;
+    font-weight: 600;
+}
 QLabel#logTitle { font-size: 12px; font-weight: 700; color: %INK_2%; letter-spacing: 1px; }
 QLabel#barBrand { background: transparent; }
 
@@ -549,14 +557,14 @@ class Worker(QObject):
 
     log_line = pyqtSignal(str)
     stage_changed = pyqtSignal(str, int, int)      # 集名, 已完成, 总数
-    progress_changed = pyqtSignal(str, int, int, str)  # 集名, done, total, 说明
+    progress_changed = pyqtSignal(str, float, float, str)  # 集名, done字节, total字节, 说明
     item_finished = pyqtSignal(str, str)
     item_failed = pyqtSignal(str, str)
     cancelled = pyqtSignal(str)
     all_done = pyqtSignal()
 
     def __init__(self, url, out_dir, quality, all_episodes, cookie, threads, proxy,
-                 items=None):
+                 items=None, audio_only=False):
         super().__init__()
         self.url = url
         self.items = items          # 直接指定要下的视频（合集勾选结果）
@@ -566,10 +574,20 @@ class Worker(QObject):
         self.cookie = cookie
         self.threads = threads
         self.proxy = proxy
+        self.audio_only = audio_only
         self._cancel = False
+        self._client = None
 
     def cancel(self):
         self._cancel = True
+        # 顺便把正在读的网络连接掐断：不掐的话，卡住的读要等到超时（最长 60 秒）
+        # 才会去看取消标志，"停止"按钮会像失灵一样。
+        c = getattr(self, "_client", None)
+        if c is not None:
+            try:
+                c.cancel()
+            except Exception:
+                pass
 
     @pyqtSlot()
     def run(self):
@@ -582,9 +600,15 @@ class Worker(QObject):
                 self.all_done.emit()
             except RuntimeError:
                 pass          # 窗口已销毁，忽略
+            # 线程自己退出事件循环。
+            # 等 GUI 线程收到 all_done 再来调 quit() 会死锁：那时 GUI 线程
+            # 可能正阻塞在 wait() 上等这个线程，于是谁也叫不动谁，
+            # 线程永远停不下来（表现就是"停止之后没法重新开始"）。
+            QThread.currentThread().quit()
 
     def _run(self):
         client = core.BiliClient(cookie=self.cookie, proxy=self.proxy or None)
+        self._client = client          # 取消时用来掐断连接
         if self.items:
             # 合集勾选结果：展开成具体分 P（一个视频可能有多个分 P，全下）
             jobs = []
@@ -643,7 +667,7 @@ class Worker(QObject):
                 out = core.download_episode(
                     client, bvid, cid, name, self.out_dir,
                     quality=self.quality, threads=self.threads,
-                    audio_only=False, ffmpeg=ffmpeg,
+                    audio_only=self.audio_only, ffmpeg=ffmpeg,
                     on_log=on_log, on_progress=on_progress, on_stage=on_stage,
                     should_stop=lambda: self._cancel)
                 self.item_finished.emit(name, out)
@@ -654,6 +678,28 @@ class Worker(QObject):
             except Exception as e:
                 self.item_failed.emit(name, str(e))
                 self.log_line.emit("  失败：%s" % e)
+
+
+class LoginCheckThread(QThread):
+    """后台查登录态。
+
+    以前是在主线程里查的 —— 一次网络请求最多卡 15 秒，
+    开窗那一下整个界面是僵的。现在放到线程里，窗口立刻就能用。
+    """
+
+    done = pyqtSignal(str, str)      # 状态(ok/invalid/error), 昵称
+
+    def __init__(self, cookie, proxy, parent=None):
+        super().__init__(parent)
+        self.cookie = cookie
+        self.proxy = proxy
+
+    def run(self):
+        try:
+            state, name = login_mod.check_login_state(self.cookie, self.proxy)
+        except Exception:
+            state, name = "error", ""
+        self.done.emit(state, name)
 
 
 # ---------------------------------------------------------------- 主窗口
@@ -668,12 +714,14 @@ class MainWindow(QMainWindow):
         self.worker = None
         self.thread = None
         self.rows = {}
+        self._stopping = False   # 点过「停止」，正在收尾
         self._speed = {}      # 集名 -> (时刻, 已下字节)，用来算速度
         self._ema = {}        # 集名 -> 平滑后的速度
         self._anims = []
         self._build_ui()
         self._load_settings()
-        QTimer.singleShot(400, self._check_login)
+        # 登录检查放到后台线程（QTimer 只是把它推迟到窗口画完之后）
+        QTimer.singleShot(60, self._check_login)
 
     # ---------------- 界面 ----------------
     def _build_ui(self):
@@ -706,6 +754,17 @@ class MainWindow(QMainWindow):
         head.addWidget(logo)
         head.addLayout(titles)
         head.addStretch(1)
+        # 登录状态：已登录显示胶囊 + 退出登录；未登录显示扫码登录按钮
+        self.login_chip = QLabel("")
+        self.login_chip.setObjectName("loginChip")
+        self.login_chip.setVisible(False)
+        head.addWidget(self.login_chip)
+        self.btn_logout = FloatButton("退出登录", "ghost")
+        self.btn_logout.setFixedHeight(34)
+        self.btn_logout.setVisible(False)
+        self.btn_logout.setToolTip("清除本机保存的登录状态")
+        self.btn_logout.clicked.connect(self.on_logout)
+        head.addWidget(self.btn_logout)
         # 登录入口放主界面右上角，必须一眼能看到（之前藏在折叠的「高级」里，等于没有）
         self.btn_login = FloatButton("扫码登录 · 解锁 1080P", "primary")
         self.btn_login.setGlyph("play", "#ffffff", 13)
@@ -717,33 +776,36 @@ class MainWindow(QMainWindow):
         root.addLayout(head)
         root.addSpacing(2)
 
-        # ---- 链接卡 ----
+        # ---- 主卡：链接 + 选项（合成一张，别拆成两张卡）----
         card = Card()
+        card.layout.setSpacing(12)
         row = QHBoxLayout()
         row.setSpacing(10)
         self.url_edit = QLineEdit()
-        self.url_edit.setPlaceholderText("粘贴 B 站链接，回车即可开始")
+        self.url_edit.setPlaceholderText("粘贴 B 站链接，回车即可浏览")
+        self.url_edit.setMinimumHeight(40)
         self.url_edit.returnPressed.connect(self.on_browse)
         self.btn_start = FloatButton("浏览…", "primary")
         self.btn_start.setGlyph("film", "#ffffff", 14)
         self.btn_start.setMinimumWidth(122)
+        self.btn_start.setMinimumHeight(40)
         self.btn_start.setToolTip("读取链接内容，预览后挑着下载")
         self.btn_start.clicked.connect(self.on_browse)
         row.addWidget(self.url_edit, 1)
         row.addWidget(self.btn_start)
         card.layout.addLayout(row)
-        root.addWidget(card)
-        self.card_link = card
 
-        # ---- 选项卡 ----
-        card = Card()
-        card.add_title("选项")
+        line = QFrame()
+        line.setFixedHeight(1)
+        line.setStyleSheet("background:%s; border:none;" % LINE)
+        card.layout.addWidget(line)
+
         opt = QHBoxLayout()
         opt.setSpacing(12)
 
         self.out_edit = QLineEdit()
         self.out_edit.setReadOnly(True)
-        self.out_edit.setMinimumWidth(280)
+        self.out_edit.setMinimumWidth(240)
         self.btn_pick = FloatButton("选择…", "ghost")
         self.btn_pick.clicked.connect(self.on_pick_dir)
         col1 = QHBoxLayout()
@@ -764,14 +826,16 @@ class MainWindow(QMainWindow):
         col2.addWidget(self.quality_box)
         opt.addLayout(col2)
 
-        self.chk_all = QCheckBox("整季下载")
-        self.chk_audio = QCheckBox("只下音频")
-        opt.addWidget(self.chk_all)
-        opt.addWidget(self.chk_audio)
+        self.btn_adv = FloatButton("高级", "ghost")
+        self.btn_adv.setGlyph("gear", INK_2, 13)
+        self.btn_adv.setFixedWidth(84)
+        self.btn_adv.setToolTip("Cookie / 代理等高级设置")
+        self.btn_adv.clicked.connect(self._toggle_adv)
+        opt.addWidget(self.btn_adv)
         opt.addStretch(1)
         card.layout.addLayout(opt)
         root.addWidget(card)
-        self.card_opt = card
+        self.card_link = card
 
         # ---- 高级卡（收起）----
         self.adv_card = Card()
@@ -789,10 +853,6 @@ class MainWindow(QMainWindow):
         av.addWidget(self.proxy_edit, 0)
         self.adv_card.layout.addLayout(av)
         self.adv_card.setVisible(False)
-        self.chk_adv = QCheckBox("显示高级设置（扫码登录 / Cookie / 代理）")
-        self.chk_adv.setCursor(Qt.PointingHandCursor)
-        self.chk_adv.toggled.connect(self._toggle_adv)
-        card.layout.addWidget(self.chk_adv)   # 放进选项卡里，别孤零零飘在页面上
         root.addWidget(self.adv_card)
 
         # ---- 队列卡 ----
@@ -906,15 +966,17 @@ class MainWindow(QMainWindow):
         anim.start()
         self._anims.append(anim)
 
-        for i, card in enumerate((self.card_link, self.card_opt,
-                                  self.card_queue, self.card_log)):
+        for i, card in enumerate((self.card_link, self.card_queue, self.card_log)):
             QTimer.singleShot(60 + i * 70, lambda c=card: self._fade_in(c))
 
     def _fade_in(self, widget):
         fade_in(widget, 280, PAGE)
 
-    def _toggle_adv(self, on):
+    def _toggle_adv(self):
+        """齿轮按钮：展开/收起高级设置。"""
+        on = not self.adv_card.isVisible()
         self.adv_card.setVisible(on)
+        self.btn_adv.setText("收起" if on else "高级")
         if on:
             self._fade_in(self.adv_card)
         # 高级卡一进一出，布局所需高度就变了；窗口跟着长/缩，
@@ -927,15 +989,32 @@ class MainWindow(QMainWindow):
 
     # ---------------- 事件 ----------------
     def _set_login_state(self, nickname):
-        """更新右上角登录按钮的显示。"""
+        """更新右上角的登录显示：已登录显示胶囊 + 退出登录，否则显示扫码登录。"""
         if nickname:
-            self.btn_login.setText("已登录：%s" % nickname)
-            self.btn_login.setGlyph("play", "#ffffff", 13)
-            self.btn_login.setToolTip("已登录，可下 1080P 及以上")
+            self.login_chip.setText("已登录 · %s" % nickname)
+            self.login_chip.setVisible(True)
+            self.btn_logout.setVisible(True)
+            self.btn_login.setVisible(False)
         else:
+            self.login_chip.setVisible(False)
+            self.btn_logout.setVisible(False)
+            self.btn_login.setVisible(True)
             self.btn_login.setText("扫码登录 · 解锁 1080P")
             self.btn_login.setGlyph("play", "#ffffff", 13)
             self.btn_login.setToolTip("用手机 B 站 App 扫码登录，未登录最高只能拿到 480P")
+
+    def on_logout(self):
+        """退出登录：清掉本机保存的登录态。"""
+        if QMessageBox.question(self, "退出登录",
+                                "要退出当前账号吗？下次下载需要重新扫码登录。",
+                                QMessageBox.Yes | QMessageBox.No,
+                                QMessageBox.No) != QMessageBox.Yes:
+            return
+        self.cookie_edit.clear()
+        self._set_login_state(None)
+        self.status_msg.setText("已退出登录")
+        self.append_log("已退出登录")
+        self._save_settings()
 
     def on_login(self):
         """扫码登录，拿到 Cookie 后存下来（高清画质需要）。"""
@@ -975,9 +1054,14 @@ class MainWindow(QMainWindow):
         self.log_view.clear()
 
     def on_clear(self):
-        if self.thread and self.thread.isRunning():
-            QMessageBox.information(self, "提示", "正在下载，先点「停止」")
-            return
+        # 刚点完「停止」的话，线程通常一两秒内就收尾了，等它一下再清
+        if self.thread is not None:
+            self.thread.quit()
+            if not self.thread.wait(8000 if self._stopping else 800):
+                QMessageBox.information(self, "提示", "正在下载，先点「停止」")
+                return
+            self.worker = None
+            self.thread = None
         self.list.clear()
         self.rows = {}
         self.list.setVisible(False)
@@ -986,6 +1070,7 @@ class MainWindow(QMainWindow):
     def on_stop(self):
         if self.worker:
             self.worker.cancel()
+            self._stopping = True
             self.status_msg.setText("正在停止…")
             self.btn_stop.setEnabled(False)
 
@@ -999,7 +1084,8 @@ class MainWindow(QMainWindow):
 
     def on_browse(self):
         """浏览：读出链接内容 -> 预览 -> 勾选 -> 确认下载。"""
-        if self.thread and self.thread.isRunning():
+        if not self._wait_idle():
+            QMessageBox.information(self, "提示", "上一个任务还没停下来，稍等一下再试")
             return
         url = self.url_edit.text().strip()
         if not url:
@@ -1030,9 +1116,16 @@ class MainWindow(QMainWindow):
         if dlg.exec_() == QDialog.Accepted:
             items = dlg.selected_items()
             if items:
-                self._start_download(url, items=items)
+                self._start_download(url, items=items, audio_only=dlg.audio_only)
 
-    def _start_download(self, url, items=None):
+    def _start_download(self, url, items=None, audio_only=False):
+        # 上一个线程可能还在收尾：必须等它真的结束。
+        # 直接覆盖 self.thread 的话，运行中的 QThread 会被析构 → Qt 直接 abort。
+        if self.thread is not None:
+            self.thread.quit()
+            self.thread.wait(5000)
+            self.worker = None
+            self.thread = None
         default_dir = os.path.join(os.path.expanduser("~"), "Downloads", "BiliFetch")
         out_dir = self.out_edit.text().strip() or default_dir
         # 必须是绝对路径：相对路径会跟着"从 Dock 启动时 CWD=/"这种奇怪状态跑，
@@ -1060,10 +1153,10 @@ class MainWindow(QMainWindow):
         self.worker = Worker(
             url=url, out_dir=out_dir,
             quality=self.quality_box.currentData(),
-            all_episodes=self.chk_all.isChecked(),
+            all_episodes=False,
             cookie=self.cookie_edit.text().strip(),
-            threads=8, proxy=self.proxy_edit.text().strip(),
-            items=items)
+            threads=16, proxy=self.proxy_edit.text().strip(),
+            items=items, audio_only=audio_only)
         self.thread = QThread()
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
@@ -1073,7 +1166,11 @@ class MainWindow(QMainWindow):
         self.worker.item_finished.connect(self.on_item_finished)
         self.worker.item_failed.connect(self.on_item_failed)
         self.worker.cancelled.connect(self.on_cancelled)
-        self.worker.all_done.connect(self.on_all_done)
+        self.worker.all_done.connect(lambda t=self.thread: self.on_all_done(t))
+        # 记住是哪个线程：旧线程收尾时不能把"新任务"的引用清掉
+        # （停止后马上重开，旧线程的 finished 回调会把新线程的引用抹掉，
+        #   新线程运行中被析构 → Qt 直接 abort）
+        self.thread.finished.connect(lambda t=self.thread: self._on_thread_finished(t))
         self.thread.start()
 
     def append_log(self, text):
@@ -1099,6 +1196,7 @@ class MainWindow(QMainWindow):
                           "merge" if stage in ("合并", "转封装") else "run")
             return
         pct = done * 100.0 / total
+        pct = max(0.0, min(100.0, pct))     # 夹一下，别让异常值把进度条画歪
         now = time.time()
         prev = self._speed.get(name)
         if prev is None or done < prev[1]:
@@ -1138,13 +1236,55 @@ class MainWindow(QMainWindow):
         self.status_msg.setText("已取消")
         self.btn_stop.setEnabled(True)
 
-    def on_all_done(self):
+    def on_all_done(self, thread=None):
+        if thread is not None and thread is not self.thread:
+            return          # 旧任务的收尾，别去动新任务
         self.btn_start.setEnabled(True)
-        self.btn_start.setText("开始下载")
-        self.btn_stop.setEnabled(True)
+        self.btn_start.setText("浏览…")
+        self.btn_stop.setEnabled(False)
         self.dot.setVisible(False)
         if self.status_msg.text() != "已取消":
             self.status_msg.setText("完成")
+        # 线程的事件循环还活着（started 触发的槽跑完就空转），
+        # 不 quit 掉的话 isRunning() 永远为真 —— 之后就没法再开新任务、也没法清空。
+        if self.thread:
+            self.thread.quit()
+
+    def _on_thread_finished(self, thread=None):
+        """线程真正退出了：把状态清干净，下一次任务才能正常开始。"""
+        if thread is not None and thread is not self.thread:
+            return          # 已经是下一个任务的线程了，别动它
+        self.worker = None
+        self.thread = None
+        self._stopping = False
+        self.btn_start.setEnabled(True)
+        self.btn_start.setText("浏览…")
+        self.btn_stop.setEnabled(False)
+        self.dot.setVisible(False)
+        if self.status_msg.text() in ("下载中…", "正在停止…"):
+            self.status_msg.setText("就绪")
+
+    def _busy(self):
+        """当前是否有任务在跑。"""
+        return bool(self.thread and self.thread.isRunning())
+
+    def _wait_idle(self, timeout=2500):
+        """等上一个任务彻底收尾。返回 False 表示还没停下来。
+
+        停止之后想马上重开，必须等线程真的退出 ——
+        否则旧的 QThread 被覆盖掉，运行中被析构会让 Qt 直接 abort。
+        正在收尾（刚点过停止）时多等一会儿，别让用户干等。
+        """
+        if self.thread is None:
+            return True
+        if self._stopping:
+            timeout = max(timeout, 8000)
+        self.thread.quit()
+        if self.thread.wait(timeout):
+            self.worker = None
+            self.thread = None
+            return True
+        return False
 
     # ---------------- 设置持久化 ----------------
     def _settings_path(self):
@@ -1167,18 +1307,34 @@ class MainWindow(QMainWindow):
             self.out_edit.setText(default)
 
     def _check_login(self):
-        """启动时看看存的 Cookie 还能不能用。"""
+        """启动时看看存的 Cookie 还能不能用（放后台线程，别卡住开窗）。"""
         cookie = self.cookie_edit.text().strip()
         if not cookie:
+            self._set_login_state(None)
             return
-        name = login_mod.check_login(cookie, self.proxy_edit.text().strip() or None)
-        if name:
+        self._login_thread = LoginCheckThread(
+            cookie, self.proxy_edit.text().strip() or None, self)
+        self._login_thread.done.connect(self._on_login_checked)
+        self._login_thread.start()
+
+    def _on_login_checked(self, state, name):
+        """登录态检查结果。
+
+        注意：网络错误（state == "error"）**不能**当成"登录失效"——
+        以前这里一失败就把 cookie 清掉，用户于是每次都要重新扫码。
+        """
+        if state == "ok":
             self._set_login_state(name)
             self.status_msg.setText("已登录：%s" % name)
-        else:
-            self.cookie_edit.clear()
+        elif state == "invalid":
+            self.cookie_edit.clear()       # 服务端说确实没登录了，才清
             self._set_login_state(None)
-            self.status_msg.setText("未登录：画质最高 480P，点右上角扫码登录解锁高清")
+            self.status_msg.setText("登录已失效，点右上角扫码重新登录")
+            self._save_settings()
+        else:
+            # 网络不通，登录态先留着，别把用户踢下线
+            self._set_login_state("已登录" if self.cookie_edit.text().strip() else None)
+            self.status_msg.setText("网络不通，暂时无法验证登录状态")
 
     def _save_settings(self):
         try:
@@ -1195,6 +1351,10 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "正在退出", "下载线程还没停下来，请稍后再关一次。")
             event.ignore()
             return
+        # 登录检查线程也不能在运行中被析构（一样会 abort）
+        lt = getattr(self, "_login_thread", None)
+        if lt is not None and lt.isRunning():
+            lt.wait(3000)
         event.accept()
 
     def _stop_worker(self):
@@ -1361,6 +1521,9 @@ def main():
         # ⌘Q 退出不会触发窗口的 closeEvent，这里补上取消 + 等线程收尾
         # （不等的话 QThread 会在运行中被销毁 → Qt abort → 崩溃弹窗）
         win._stop_worker()
+        lt = getattr(win, "_login_thread", None)
+        if lt is not None and lt.isRunning():
+            lt.wait(3000)
 
     app.aboutToQuit.connect(shutdown)
     sys.exit(app.exec_())

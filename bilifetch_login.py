@@ -134,10 +134,16 @@ class QrLogin:
             return None
 
 
-def check_login(cookie="", proxy=None):
-    """检查一串 cookie 是不是有效的登录态，返回昵称或 None。"""
+def check_login_state(cookie="", proxy=None):
+    """检查 cookie 是不是有效的登录态。
+
+    返回 (状态, 昵称)，状态取值：
+      ok      登录有效
+      invalid 服务端明确说没登录（cookie 过期了）
+      error   网络/其它错误（**不代表 cookie 失效**，别把用户踢下线）
+    """
     if not cookie:
-        return None
+        return "invalid", ""
     s = requests.Session()
     s.trust_env = False
     if proxy:
@@ -146,6 +152,14 @@ def check_login(cookie="", proxy=None):
     try:
         r = s.get(NAV_URL, headers={"Cookie": cookie}, timeout=15)
         data = r.json().get("data") or {}
-        return data.get("uname") if data.get("isLogin") else None
     except Exception:
-        return None
+        return "error", ""
+    if not data.get("isLogin"):
+        return "invalid", ""
+    return "ok", (data.get("uname") or "已登录")
+
+
+def check_login(cookie="", proxy=None):
+    """检查一串 cookie 是不是有效的登录态，返回昵称或 None。"""
+    state, name = check_login_state(cookie, proxy)
+    return name if state == "ok" else None

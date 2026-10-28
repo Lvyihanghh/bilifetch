@@ -19,6 +19,20 @@ from bilifetch_ui import Card, SectionTitle   # noqa: E402
 
 THUMB_W, THUMB_H = 96, 54
 
+# 还没停干净的抓图线程先挂在这里：对话框销毁时不能把它们一起带走
+# （运行中的 QThread 被析构 → Qt abort），等它们自己结束再删。
+_live_threads = []
+
+
+def _release_thread(t):
+    """线程自己跑完了：撤掉引用并删除。"""
+    if t in _live_threads:
+        _live_threads.remove(t)
+    try:
+        t.deleteLater()
+    except RuntimeError:
+        pass
+
 # 读取合集用的客户端，由主窗口在打开对话框前设置（这样能用上 Cookie / 代理）
 collection_client = None
 
@@ -56,7 +70,8 @@ class CoverThread(QThread):
         from concurrent.futures import ThreadPoolExecutor, as_completed
         if not self.urls:
             return
-        with ThreadPoolExecutor(max_workers=self.WORKERS) as pool:
+        pool = ThreadPoolExecutor(max_workers=self.WORKERS)
+        try:
             futures = {pool.submit(self._fetch, url): idx for idx, url in self.urls}
             for fut in as_completed(futures):
                 if self._stop:
@@ -67,6 +82,13 @@ class CoverThread(QThread):
                     img = None
                 if img is not None:
                     self.ready.emit(futures[fut], img)
+        finally:
+            # 不用 with：with 退出时会等所有在途请求跑完（每个最长 12 秒），
+            # 对话框关了还得等半天。这里不等，让后台自己收尾。
+            try:
+                pool.shutdown(wait=False, cancel_futures=True)
+            except TypeError:          # 老版本 Python 没有 cancel_futures
+                pool.shutdown(wait=False)
 
 
 class ItemRow(QWidget):
@@ -199,6 +221,10 @@ class CollectionDialog(QDialog):
         self.chk_extra.setToolTip("番剧除了正片还有 PV、花絮、二创解析等分区")
         self.chk_extra.toggled.connect(self._toggle_extra)
         tools.addWidget(self.chk_extra)
+        # 只下音频放这里：属于"这次要什么"的选项，不该占主界面
+        self.chk_audio = QCheckBox("只下音频")
+        self.chk_audio.setToolTip("只保存音频（m4a），不下载视频画面")
+        tools.addWidget(self.chk_audio)
         for text, slot in (("全选", self._select_all), ("全不选", self._select_none),
                            ("反选", self._invert)):
             b = QPushButton(text)
@@ -397,13 +423,31 @@ class CollectionDialog(QDialog):
         return [r.item for i, r in enumerate(self.rows)
                 if r.check.isChecked() and not self.list.isRowHidden(i)]
 
+    @property
+    def audio_only(self):
+        """只下音频（在浏览窗口里勾）。"""
+        return self.chk_audio.isChecked()
+
     def _stop_threads(self):
+        """停掉后台抓图线程。
+
+        关键：抓图线程可能正卡在网络请求上（超时 12 秒），
+        等 1.5 秒未必能停干净。**运行中的 QThread 被析构会让 Qt 直接 abort**，
+        所以等不干净时要把它从父子关系里摘出来、并且 Python 侧继续持有引用，
+        等它自己跑完再删 —— 提前删（GC）同样会炸。
+        """
         for name in ("_cover_thread", "_thumb_thread"):
             t = getattr(self, name, None)
-            if t is not None:
-                t.stop()
-                t.wait(1500)
-                setattr(self, name, None)
+            if t is None:
+                continue
+            t.stop()
+            if t.wait(1500):
+                t.deleteLater()
+            else:
+                t.setParent(None)
+                _live_threads.append(t)
+                t.finished.connect(lambda th=t: _release_thread(th))
+            setattr(self, name, None)
 
     def done(self, r):
         self._stop_threads()
