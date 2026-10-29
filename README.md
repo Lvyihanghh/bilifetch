@@ -206,7 +206,7 @@ python3 bilifetch.py "https://www.bilibili.com/bangumi/play/ep1633643"
 -a, --audio-only     只下音频（输出 .m4a）
 -c, --cookie "..."   带上 Cookie（登录后才有高清）
 --cookie-file FILE   Cookie 文件（浏览器导出的 cookies.txt 或纯文本）
--t, --threads N      分段下载的并发数，默认 8
+-t, --threads N      分段下载的并发数，默认 16
 --cdn HOST           指定 CDN 镜像（一般不用，程序会自动挑最快的）
 --proxy URL          走代理，例如 http://127.0.0.1:7890（默认直连）
 --force              已存在的文件也重新下载

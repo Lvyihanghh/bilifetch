@@ -857,7 +857,7 @@ def main():
     ap.add_argument("--cookie-file", default="", help="Cookie 文件（浏览器导出的 cookies.txt 或纯文本）")
     ap.add_argument("--proxy", default="", help="代理，例如 http://127.0.0.1:7890（默认直连）")
     ap.add_argument("-t", "--threads", type=int, default=16,
-                    help="分段下载的并发数，默认 8（1-16）")
+                    help="分段下载的并发数，默认 16（1-32）")
     ap.add_argument("--cdn", default="", help="指定 CDN 镜像，如 upos-sz-mirrorhw.bilivideo.com")
     ap.add_argument("--force", action="store_true", help="已存在的文件也重新下载")
     ap.add_argument("--list", action="store_true", dest="list_q", help="只列出可用画质，不下载")
