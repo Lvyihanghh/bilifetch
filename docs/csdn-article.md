@@ -1,7 +1,6 @@
-# 用 Python + PyQt5 重写一个 B 站下载器：图形界面 + 命令行，一次打包 macOS/Linux 通吃
-
 > 写给想省事下载 B 站视频、又想看懂实现细节的同行。
 > 全文代码约 3900 行，Apache-2.0 开源，macOS / Linux 都有现成安装包。
+> 项目地址：https://github.com/oldsixxiaolv/bilifetch
 
 ---
 
@@ -16,9 +15,9 @@
 | Java 版 GUI 工具 | 要自己装 JRE，还要补 `ffmpeg`，命令行和图形两套 UI |
 | yt-dlp 之类 | 强，但 B 站需要额外配置，且没有「浏览、勾选、再批量下」的界面 |
 
-于是我写了一个：**`BiliFetch`** —— 图形界面和命令行**共用同一套下载逻辑**，pip/brew/一条命令都能装，图标是一只小狐狸。
+于是我写了一个：**`BiliFetch`** —— 图形界面和命令行**共用同一套下载逻辑**，`brew install --cask bilifetch` 一条命令就能装，图标是一只小狐狸。
 
-![BiliFetch 主界面](docs/screenshot.png)
+![BiliFetch 主界面](https://raw.githubusercontent.com/oldsixxiaolv/bilifetch/main/docs/screenshot.png)
 
 **它能做什么**
 
@@ -28,7 +27,9 @@
 - 断点续传、并发分段、CDN 自动挑最快镜像、`ffmpeg` 无损合并
 - macOS 一个 `.app` 双击即用（**用户机器不需要装 Python**），Linux 一个 `.deb`
 
-![浏览预览](docs/screenshot-collection.png)
+![浏览预览](https://raw.githubusercontent.com/oldsixxiaolv/bilifetch/main/docs/screenshot-collection.png)
+
+![扫码登录](https://raw.githubusercontent.com/oldsixxiaolv/bilifetch/main/docs/screenshot-login.png)
 
 ---
 
@@ -134,7 +135,7 @@ def cancel(self):
 - **淡入动画踩了个 PyQt 的坑**：给自绘控件套 `QGraphicsOpacityEffect`，Qt 会把控件重定向到 effect 自己的 pixmap，和控件 `paintEvent` 里的 `QPainter` 抢同一个绘制设备，控制台刷 136 条 `A paint device can only be painted by one painter at a time`，界面还会画花。改成自己盖一层半透明遮罩渐隐就干净了。
 - **二维码被裁掉**：登录框里二维码原图 424×424，而承载它的标签只有 260×260 —— `QLabel` 对超尺寸的 pixmap 是「按原样画、超出部分裁掉」，**不会自动缩小**。手机上扫到的是残缺码，表现为「扫码没反应」。缩放 + `setDevicePixelRatio(2.0)` 解决，Retina 上还不糊。
 
-![下载中](docs/screenshot-empty.png)
+![下载中](https://raw.githubusercontent.com/oldsixxiaolv/bilifetch/main/docs/screenshot-empty.png)
 
 ---
 
@@ -165,8 +166,6 @@ bilifetch 'https://www.bilibili.com/bangumi/play/ep1633643'
 bilifetch -c "SESSDATA=你的cookie" -q 80 'BV1xx411c7mD'    # 指定画质
 bilifetch --audio-only 'BV1xx411c7mD'                       # 只下音频
 ```
-
-![扫码登录](docs/screenshot-login.png)
 
 ---
 
