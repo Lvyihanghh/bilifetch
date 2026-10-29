@@ -12,10 +12,10 @@ cask "bilifetch" do
   version "1.0.0"
   sha256 "5ca3f6083c7ef05a88b3f01c681030ad43ae37af9448a47178aed3942afa3887"
 
-  url "https://github.com/Lvyihanghh/bilifetch/releases/download/v#{version}/BiliFetch-#{version}-macOS.dmg"
+  url "https://github.com/oldsixxiaolv/bilifetch/releases/download/v#{version}/BiliFetch-#{version}-macOS.dmg"
   name "BiliFetch"
   desc "B 站视频下载器（图形界面 + 命令行，支持番剧 / 分P / b23.tv 短链）"
-  homepage "https://github.com/Lvyihanghh/bilifetch"
+  homepage "https://github.com/oldsixxiaolv/bilifetch"
 
   app "BiliFetch.app"
 
