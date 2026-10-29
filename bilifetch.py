@@ -143,9 +143,19 @@ class BiliClient:
         光置取消标志不够：请求正卡在 socket 读取上时，要等到读超时（最长 60 秒）
         才会去看标志 —— 表现就是"点了停止半天停不下来"。
         这里直接把连接关掉，阻塞的读会立刻抛错，然后重试逻辑就会看到取消标志。
+
+        关连接的动作放到后台线程：close() 可能和正在读的线程抢锁，
+        放在界面线程里做会把界面卡住。
         """
         with self._active_lock:
             resp_list = list(self._active)
+        if not resp_list:
+            return
+        threading.Thread(target=self._close_all, args=(resp_list,),
+                         name="cancel-conns", daemon=True).start()
+
+    @staticmethod
+    def _close_all(resp_list):
         for r in resp_list:
             try:
                 r.close()
@@ -377,20 +387,27 @@ class BiliClient:
         return out
 
     def _fastest_cdn(self, urls, referer, should_stop=None):
-        """每个候选地址探一次速，挑最快的；够快就不再探。
+        """挑最快的镜像。
 
-        两处讲究：
+        这里以前是**串行**探的，坑很大：
+        候选镜像有 18 个（9 个域名 × 主/备地址），里面不少是坏的或者极慢的。
+        串行探、每个最多等 11 秒（连接 5 + 读取 6），
+        实测下载开始前要白等 **11.6 秒**，而且这段时间里点「停止」几乎没反应
+        （请求正卡在等响应头，取消标志根本没机会被看到）。
+
+        改成**并行探**：所有候选一起测，取最快的。整体耗时 ≈ 单个候选的耗时。
+        另外两点讲究：
         1) 计时从**收到响应头之后**开始 —— 连接和 TLS 握手那几百毫秒不该算进去，
            否则快的镜像会被误判成慢的（实测镜像之间能差 40 倍，选错就全程慢）。
-        2) 探 512KB：样本太小容易被单次抖动带偏。
+        2) 探速用很短的超时（探速只是要个相对快慢，不用等满）。
         """
-        best, best_speed = None, 0.0
-        for u in urls:
-            if should_stop and should_stop():
-                raise Cancelled()
+        if not urls:
+            return None
+
+        def probe(u):
             try:
-                resp = self.session.get(u, headers=self._range_headers(referer, 0, 512 * 1024),
-                                        stream=True, timeout=(5, 6))
+                resp = self.session.get(u, headers=self._range_headers(referer, 0, 256 * 1024),
+                                        stream=True, timeout=(2.5, 2.5))
                 self._track(resp)
                 try:
                     t = time.time()          # 响应头到了才开始算传输速度
@@ -398,17 +415,30 @@ class BiliClient:
                 finally:
                     self._untrack(resp)
                     resp.close()
-            except Cancelled:
-                raise
+                if n <= 0:
+                    return None
+                return (n / max(time.time() - t, 0.01), u)
             except Exception:
-                continue
-            if n <= 0:
-                continue
-            speed = n / max(time.time() - t, 0.01)
-            if speed > best_speed:
-                best, best_speed = u, speed
-            if best_speed > 8e6:          # 8 MB/s 单连接够快了，不值得再探
-                break
+                return None
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        best, best_speed = None, 0.0
+        pool = ThreadPoolExecutor(max_workers=min(12, len(urls)))
+        try:
+            futures = [pool.submit(probe, u) for u in urls]
+            for fut in as_completed(futures):
+                if should_stop and should_stop():
+                    raise Cancelled()
+                res = fut.result()
+                if res and res[0] > best_speed:
+                    best_speed, best = res[0], res[1]
+                if best_speed > 5e6:       # 5 MB/s 单连接就够快，不用等其它镜像
+                    break
+        finally:
+            try:
+                pool.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                pool.shutdown(wait=False)
         if best:
             log("    CDN 镜像：%s  探速 %.2f MB/s" % (urlparse(best).netloc, best_speed / 1e6))
         return best
@@ -420,7 +450,7 @@ class BiliClient:
     def _total_size(self, url, referer):
         """用一个 1 字节的 Range 请求探出文件总大小。"""
         resp = self.session.get(url, headers=self._range_headers(referer, 0, 0),
-                                stream=True, timeout=(10, 15))
+                                stream=True, timeout=(6, 10))
         self._track(resp)
         try:
             cr = resp.headers.get("Content-Range") or ""
@@ -439,7 +469,7 @@ class BiliClient:
                 raise Cancelled()
             try:
                 resp = self.session.get(url, headers=self._range_headers(referer, start + written, end),
-                                        stream=True, timeout=(10, 4))
+                                        stream=True, timeout=(5, 4))
                 self._track(resp)
                 try:
                     if resp.status_code not in (200, 206):

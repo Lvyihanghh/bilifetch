@@ -719,6 +719,32 @@ class LoginCheckThread(QThread):
         self.done.emit(state, name)
 
 
+class PreviewThread(QThread):
+    """后台读链接内容。
+
+    这一步是网络请求（要打 B 站好几个接口），放界面线程里做的话，
+    窗口在读取期间是**完全僵的** —— 用户看到的就是"一点下载就卡住"。
+    """
+
+    done = pyqtSignal(object)      # info
+    failed = pyqtSignal(str)
+
+    def __init__(self, url, cookie, proxy, parent=None):
+        super().__init__(parent)
+        self.url = url
+        self.cookie = cookie
+        self.proxy = proxy
+
+    def run(self):
+        try:
+            client = core.BiliClient(cookie=self.cookie, proxy=self.proxy or None)
+            collection_gui.collection_client = client
+            info = collection.fetch_preview(client, self.url)
+            self.done.emit(info)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
 # ---------------------------------------------------------------- 主窗口
 class MainWindow(QMainWindow):
 
@@ -732,6 +758,9 @@ class MainWindow(QMainWindow):
         self.thread = None
         self.rows = {}
         self._stopping = False   # 点过「停止」，正在收尾
+        self._pending_browse = False    # 收尾完成后要接着做的事
+        self._pending_clear = False
+        self._pending_download = None
         self._speed = {}      # 集名 -> (时刻, 已下字节)，用来算速度
         self._ema = {}        # 集名 -> 平滑后的速度
         self._anims = []
@@ -1106,14 +1135,14 @@ class MainWindow(QMainWindow):
         self.log_view.clear()
 
     def on_clear(self):
-        # 刚点完「停止」的话，线程通常一两秒内就收尾了，等它一下再清
-        if self.thread is not None:
-            self.thread.quit()
-            if not self.thread.wait(8000 if self._stopping else 800):
-                QMessageBox.information(self, "提示", "正在下载，先点「停止」")
-                return
-            self.worker = None
-            self.thread = None
+        # 正在收尾时不要在界面线程里等（会卡住窗口）——记下来，停了自动清
+        if self._busy():
+            self._pending_clear = True
+            self.status_msg.setText("正在停止，停完就清空")
+            return
+        self._do_clear()
+
+    def _do_clear(self):
         self.list.clear()
         self.rows = {}
         self.list.setVisible(False)
@@ -1136,8 +1165,11 @@ class MainWindow(QMainWindow):
 
     def on_browse(self):
         """浏览：读出链接内容 -> 预览 -> 勾选 -> 确认下载。"""
-        if not self._wait_idle():
-            QMessageBox.information(self, "提示", "上一个任务还没停下来，稍等一下再试")
+        if self._busy():
+            # 上一个任务还在收尾：**不要在界面线程里等**（会卡住整个窗口）。
+            # 先记下来，线程一停就自动继续。
+            self._pending_browse = True
+            self.status_msg.setText("正在停止，马上继续…")
             return
         url = self.url_edit.text().strip()
         if not url:
@@ -1145,24 +1177,32 @@ class MainWindow(QMainWindow):
             return
 
         self.btn_start.setEnabled(False)
+        self.btn_start.setText("读取中…")
         self.status_msg.setText("正在读取…")
-        QApplication.processEvents()
-        try:
-            client = core.BiliClient(cookie=self.cookie_edit.text().strip(),
-                                     proxy=self.proxy_edit.text().strip() or None)
-            collection_gui.collection_client = client
-            info = collection.fetch_preview(client, url)
-        except Exception as e:
-            self.btn_start.setEnabled(True)
-            self.status_msg.setText("读取失败")
-            QMessageBox.warning(self, "读取失败", str(e))
-            return
+        self._preview_url = url
+        # 读取是网络请求，放后台线程 —— 否则窗口在读取期间完全僵住
+        self._preview_thread = PreviewThread(
+            url, self.cookie_edit.text().strip(),
+            self.proxy_edit.text().strip(), self)
+        self._preview_thread.done.connect(self._on_preview)
+        self._preview_thread.failed.connect(self._on_preview_failed)
+        self._preview_thread.start()
+
+    def _on_preview_failed(self, msg):
         self.btn_start.setEnabled(True)
+        self.btn_start.setText("浏览…")
+        self.status_msg.setText("读取失败")
+        QMessageBox.warning(self, "读取失败", msg)
+
+    def _on_preview(self, info):
+        self.btn_start.setEnabled(True)
+        self.btn_start.setText("浏览…")
         self.status_msg.setText("就绪")
         if not info or not info.get("items"):
             QMessageBox.information(self, "提示", "这个链接里没有可下载的内容")
             return
 
+        url = self._preview_url
         dlg = CollectionDialog(info, url, self)
         dlg.url_edit.setText(url)
         if dlg.exec_() == QDialog.Accepted:
@@ -1171,13 +1211,12 @@ class MainWindow(QMainWindow):
                 self._start_download(url, items=items, audio_only=dlg.audio_only)
 
     def _start_download(self, url, items=None, audio_only=False):
-        # 上一个线程可能还在收尾：必须等它真的结束。
-        # 直接覆盖 self.thread 的话，运行中的 QThread 会被析构 → Qt 直接 abort。
+        # 上一个线程可能还在收尾：绝不能覆盖它（运行中的 QThread 被析构 → Qt abort），
+        # 也**不能等**（界面会卡住）。记下来，线程一停就自动开始。
         if self.thread is not None:
-            self.thread.quit()
-            self.thread.wait(5000)
-            self.worker = None
-            self.thread = None
+            self._pending_download = (url, items, audio_only)
+            self.status_msg.setText("正在停止，马上开始…")
+            return
         default_dir = os.path.join(os.path.expanduser("~"), "Downloads", "BiliFetch")
         out_dir = self.out_edit.text().strip() or default_dir
         # 必须是绝对路径：相对路径会跟着"从 Dock 启动时 CWD=/"这种奇怪状态跑，
@@ -1304,7 +1343,7 @@ class MainWindow(QMainWindow):
             self.thread.quit()
 
     def _on_thread_finished(self, thread=None):
-        """线程真正退出了：把状态清干净，下一次任务才能正常开始。"""
+        """线程真正退出了：把状态清干净，并处理排队的后续操作。"""
         if thread is not None and thread is not self.thread:
             return          # 已经是下一个任务的线程了，别动它
         self.worker = None
@@ -1317,27 +1356,21 @@ class MainWindow(QMainWindow):
         if self.status_msg.text() in ("下载中…", "正在停止…"):
             self.status_msg.setText("就绪")
 
+        # 排队的事：清空 / 继续浏览 / 开始下载 —— 都在这里接上
+        if self._pending_clear:
+            self._pending_clear = False
+            self._do_clear()
+        if self._pending_download:
+            url, items, audio_only = self._pending_download
+            self._pending_download = None
+            QTimer.singleShot(0, lambda: self._start_download(url, items, audio_only))
+        elif self._pending_browse:
+            self._pending_browse = False
+            QTimer.singleShot(0, self.on_browse)
+
     def _busy(self):
         """当前是否有任务在跑。"""
         return bool(self.thread and self.thread.isRunning())
-
-    def _wait_idle(self, timeout=2500):
-        """等上一个任务彻底收尾。返回 False 表示还没停下来。
-
-        停止之后想马上重开，必须等线程真的退出 ——
-        否则旧的 QThread 被覆盖掉，运行中被析构会让 Qt 直接 abort。
-        正在收尾（刚点过停止）时多等一会儿，别让用户干等。
-        """
-        if self.thread is None:
-            return True
-        if self._stopping:
-            timeout = max(timeout, 8000)
-        self.thread.quit()
-        if self.thread.wait(timeout):
-            self.worker = None
-            self.thread = None
-            return True
-        return False
 
     # ---------------- 设置持久化 ----------------
     def _settings_path(self):
