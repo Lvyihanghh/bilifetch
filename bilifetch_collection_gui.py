@@ -48,23 +48,30 @@ class CoverThread(QThread):
 
     ready = pyqtSignal(int, QImage)
 
-    def __init__(self, urls, parent=None):
+    def __init__(self, urls, parent=None, size=(THUMB_W, THUMB_H)):
         super().__init__(parent)
         self.urls = urls          # [(index, url)]
+        self.size = size          # 缩放到多大（后台做，别在界面线程里做）
         self._stop = False
 
     def stop(self):
         self._stop = True
 
-    @staticmethod
-    def _fetch(url):
+    def _fetch(self, url):
         import requests
         s = requests.Session()
         s.trust_env = False
         s.headers.update({"User-Agent": "Mozilla/5.0", "Referer": "https://www.bilibili.com/"})
         r = s.get(url, timeout=12)
         img = QImage()
-        return img if img.loadFromData(r.content) else None
+        if not img.loadFromData(r.content):
+            return None
+        # 缩放放后台做：B 站封面原图是 1920x1080，
+        # 在界面线程里 scaled() 一次要十几毫秒，91 张图会把界面拖得一顿一顿的
+        w0, h0 = self.size
+        scaled = img.scaled(w0, h0, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+        w, h = scaled.width(), scaled.height()
+        return scaled.copy((w - w0) // 2, (h - h0) // 2, w0, h0)
 
     def run(self):
         from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -136,10 +143,8 @@ class ItemRow(QWidget):
         lay.addLayout(box, 1)
 
     def set_cover(self, img):
-        scaled = img.scaled(THUMB_W, THUMB_H, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
-        w, h = scaled.width(), scaled.height()
-        scaled = scaled.copy((w - THUMB_W) // 2, (h - THUMB_H) // 2, THUMB_W, THUMB_H)
-        self.thumb.setPixmap(QPixmap.fromImage(scaled))
+        # 缩放已经在后台线程做过了，这里只做 QImage -> QPixmap（很快）
+        self.thumb.setPixmap(QPixmap.fromImage(img))
         self.thumb.setStyleSheet("")
 
 
@@ -153,6 +158,7 @@ class CollectionDialog(QDialog):
         super().__init__(parent)
         self.info = info or {}
         self.rows = []
+        self._items = []      # 原始条目（self.rows 里可能是 None，见 _populate）
         self.setWindowTitle("BiliFetch · 浏览")
         self.setMinimumSize(760, 620)
         self.resize(840, 720)
@@ -244,15 +250,7 @@ class CollectionDialog(QDialog):
             "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}"
             "QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical{background:transparent;}")
         items = self.info.get("items") or []
-        for i, it in enumerate(items):
-            row = ItemRow(it, i)
-            itw = QListWidgetItem()
-            itw.setSizeHint(QSize(0, 80))
-            self.list.addItem(itw)
-            self.list.setItemWidget(itw, row)
-            self.rows.append(row)
-            if it.get("extra"):
-                self.list.setRowHidden(i, True)     # 花絮默认折叠
+        self._populate(items)
         root.addWidget(self.list, 1)
 
         # ---- 底部 ----
@@ -275,12 +273,58 @@ class CollectionDialog(QDialog):
         root.addLayout(bottom)
 
         for row in self.rows:
-            row.check.stateChanged.connect(self._update_count)
+            if row is not None:
+                row.check.stateChanged.connect(self._update_count)
         self._update_count()
 
         # 封面 + 缩略图后台加载
         self._cover_thread = None
+        self._live_extra_threads = []
         QTimer.singleShot(0, self._load_covers)
+
+    def _populate(self, items):
+        """按条目建列表。
+
+        花絮/二创默认是折叠的，它们的**行控件先不建** ——
+        一集 101 条全建要 700 多个控件、160ms，窗口打开那一下明显发涩；
+        等用户真展开时再补建。
+        """
+        self.list.clear()
+        self.rows = []
+        self._items = list(items)
+        # 建行控件期间关掉刷新：setItemWidget 每调一次都要重排一次列表，
+        # 开着刷新会白白重排十几遍（一次 4~5ms，几十行就是上百毫秒）
+        self.list.setUpdatesEnabled(False)
+        try:
+            self._fill_rows(items)
+        finally:
+            self.list.setUpdatesEnabled(True)
+
+    def _fill_rows(self, items):
+        for i, it in enumerate(items):
+            itw = QListWidgetItem()
+            itw.setSizeHint(QSize(0, 80))
+            self.list.addItem(itw)
+            if it.get("extra"):
+                self.rows.append(None)          # 花絮：等展开时再建
+                self.list.setRowHidden(i, True)
+            else:
+                row = ItemRow(it, i)
+                self.list.setItemWidget(itw, row)
+                self.rows.append(row)
+                row.check.stateChanged.connect(self._update_count)
+
+    def _build_extra_rows(self):
+        """展开花絮时，把它们的行控件补建出来。"""
+        built = False
+        for i, it in enumerate(self._items):
+            if it.get("extra") and self.rows[i] is None:
+                row = ItemRow(it, i)
+                row.check.stateChanged.connect(self._update_count)
+                self.rows[i] = row
+                self.list.setItemWidget(self.list.item(i), row)
+                built = True
+        return built
 
     # ---------- 重新读取 ----------
     def _reload(self):
@@ -315,19 +359,10 @@ class CollectionDialog(QDialog):
             s.setText("%s · 共 %d 个%s" % (info.get("kind_label", "合集"),
                                           len(info.get("items") or []),
                                           "　·　" + owner if owner else ""))
-        self.list.clear()
-        self.rows = []
-        for i, it in enumerate(info.get("items") or []):
-            row = ItemRow(it, i)
-            itw = QListWidgetItem()
-            itw.setSizeHint(QSize(0, 80))
-            self.list.addItem(itw)
-            self.list.setItemWidget(itw, row)
-            self.rows.append(row)
-            if it.get("extra"):
-                self.list.setRowHidden(i, True)
+        self._populate(info.get("items") or [])
         for row in self.rows:
-            row.check.stateChanged.connect(self._update_count)
+            if row is not None:
+                row.check.stateChanged.connect(self._update_count)
         self._update_count()
         self._load_covers()
 
@@ -336,80 +371,95 @@ class CollectionDialog(QDialog):
         items = self.info.get("items") or []
         cover = self.info.get("cover") or (items[0].get("pic") if items else "")
         if cover:
-            self._cover_thread = CoverThread([(-1, cover)], self)
+            self._cover_thread = CoverThread(
+                [(-1, cover)], self, size=(self.cover.width(), self.cover.height()))
             self._cover_thread.ready.connect(self._on_cover)
             self._cover_thread.start()
-        urls = [(i, it.get("pic")) for i, it in enumerate(items) if it.get("pic")]
+        urls = [(i, it.get("pic")) for i, it in enumerate(items)
+                if it.get("pic") and not it.get("extra")]
         if urls:
             self._thumb_thread = CoverThread(urls[:120], self)
             self._thumb_thread.ready.connect(self._on_cover)
             self._thumb_thread.start()
 
     def _on_cover(self, idx, img):
+        # 图已经在后台缩放好了，这里只做 QImage -> QPixmap
         if idx < 0:
-            scaled = img.scaled(self.cover.width(), self.cover.height(),
-                                Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
-            w, h = scaled.width(), scaled.height()
-            scaled = scaled.copy((w - self.cover.width()) // 2, (h - self.cover.height()) // 2,
-                                 self.cover.width(), self.cover.height())
-            self.cover.setPixmap(QPixmap.fromImage(scaled))
+            self.cover.setPixmap(QPixmap.fromImage(img))
             self.cover.setStyleSheet("")
-        elif idx < len(self.rows):
+        elif idx < len(self.rows) and self.rows[idx] is not None:
             self.rows[idx].set_cover(img)
             self._update_thumb_count()
 
     def _update_thumb_count(self):
         """缩略图加载进度提示。"""
-        total = sum(1 for r in self.rows if not r.item.get("extra"))
-        got = sum(1 for r in self.rows
-                  if not r.item.get("extra")
+        total = sum(1 for it in self._items if not it.get("extra"))
+        got = sum(1 for it, r in zip(self._items, self.rows)
+                  if not it.get("extra") and r is not None
                   and r.thumb.pixmap() is not None and not r.thumb.pixmap().isNull())
         self.thumb_label.setText("缩略图 %d/%d" % (got, total) if got < total else "")
 
     # ---------- 选择 ----------
     def _toggle_extra(self, on):
         """花絮/二创分区默认折叠，勾上才显示。"""
-        for i, row in enumerate(self.rows):
-            if row.item.get("extra"):
+        if on:
+            self._build_extra_rows()      # 行控件这时才建
+            self._load_extra_covers()
+        for i, it in enumerate(self._items):
+            if it.get("extra"):
                 self.list.setRowHidden(i, not on)
         self._update_count()
 
+    def _load_extra_covers(self):
+        """展开花絮后，补抓它们的缩略图。"""
+        urls = [(i, it.get("pic")) for i, it in enumerate(self._items)
+                if it.get("extra") and it.get("pic") and self.rows[i] is not None]
+        if not urls:
+            return
+        t = CoverThread(urls[:120], self)
+        t.ready.connect(self._on_cover)
+        t.finished.connect(lambda th=t: _release_thread(th))
+        self._live_extra_threads.append(t)
+        t.start()
+
     def _extra_count(self):
-        return sum(1 for r in self.rows if r.item.get("extra"))
+        return sum(1 for it in self._items if it.get("extra"))
 
     def _visible_rows(self):
         kw = self.search.text().strip().lower()
         out = []
-        for i, row in enumerate(self.rows):
-            if not kw or kw in (row.item.get("title") or "").lower() or kw in row.item.get("bvid", "").lower():
-                out.append((i, row))
+        for i, it in enumerate(self._items):
+            if not kw or kw in (it.get("title") or "").lower() or kw in (it.get("bvid") or "").lower():
+                out.append((i, it))
         return out
 
     def _filter(self):
         vis = self._visible_rows()
-        for i, row in enumerate(self.rows):
-            self.list.setRowHidden(i, i not in {j for j, _ in vis})
+        keep = {j for j, _ in vis}
+        for i in range(len(self._items)):
+            self.list.setRowHidden(i, i not in keep)
         self._update_count()
 
     def _select_all(self):
         """全选：作用于当前可见的条目（花絮折叠时不勾它）。"""
         for i, row in enumerate(self.rows):
-            if not self.list.isRowHidden(i):
+            if row is not None and not self.list.isRowHidden(i):
                 row.check.setChecked(True)
 
     def _select_none(self):
         for i, row in enumerate(self.rows):
-            if not self.list.isRowHidden(i):
+            if row is not None and not self.list.isRowHidden(i):
                 row.check.setChecked(False)
 
     def _invert(self):
         for i, row in enumerate(self.rows):
-            if not self.list.isRowHidden(i):
+            if row is not None and not self.list.isRowHidden(i):
                 row.check.setChecked(not row.check.isChecked())
 
     def _update_count(self):
-        vis = [i for i in range(len(self.rows)) if not self.list.isRowHidden(i)]
-        n = sum(1 for i in vis if self.rows[i].check.isChecked())
+        vis = [i for i in range(len(self._items)) if not self.list.isRowHidden(i)]
+        n = sum(1 for i in vis
+                if self.rows[i] is not None and self.rows[i].check.isChecked())
         extra = self._extra_count()
         txt = "已选 %d / %d 个" % (n, len(vis))
         if extra and not self.chk_extra.isChecked():
@@ -420,8 +470,8 @@ class CollectionDialog(QDialog):
 
     # ---------- 结果 ----------
     def selected_items(self):
-        return [r.item for i, r in enumerate(self.rows)
-                if r.check.isChecked() and not self.list.isRowHidden(i)]
+        return [self._items[i] for i, r in enumerate(self.rows)
+                if r is not None and r.check.isChecked() and not self.list.isRowHidden(i)]
 
     @property
     def audio_only(self):
@@ -436,8 +486,9 @@ class CollectionDialog(QDialog):
         所以等不干净时要把它从父子关系里摘出来、并且 Python 侧继续持有引用，
         等它自己跑完再删 —— 提前删（GC）同样会炸。
         """
-        for name in ("_cover_thread", "_thumb_thread"):
-            t = getattr(self, name, None)
+        threads = [getattr(self, name, None) for name in ("_cover_thread", "_thumb_thread")]
+        threads += list(getattr(self, "_live_extra_threads", []))
+        for t in threads:
             if t is None:
                 continue
             t.stop()

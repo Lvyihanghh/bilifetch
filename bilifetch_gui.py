@@ -16,6 +16,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 
@@ -401,9 +402,11 @@ class SlimBar(QWidget):
         # 流光：一道柔和高光缓慢扫过进度条
         self._shine_timer = QTimer(self)
         self._shine_timer.timeout.connect(self._tick_shine)
-        self._shine_timer.start(40)
+        self._shine_timer.start(70)     # 40ms 太密了，70ms 肉眼看不出差别
 
     def _tick_shine(self):
+        if not self.isVisible() or self._value >= 99.5:
+            return          # 看不见的、或已经满了，就别浪费重绘
         self._shine = (self._shine + 0.02) % 1.0
         self.update()
 
@@ -553,9 +556,11 @@ class PulsingDot(QWidget):
         self._phase = 0.0
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
-        self._timer.start(40)
+        self._timer.start(80)     # 40ms 太密，80ms 足够顺滑
 
     def _tick(self):
+        if not self.isVisible():
+            return          # 不在屏幕上就别重绘
         self._phase = (self._phase + 0.09) % (2 * math.pi)
         self.update()
 
@@ -1602,6 +1607,10 @@ def main():
     sys.excepthook = gui_excepthook
     win = MainWindow()
     win.show()
+    # 开窗之后再后台预热 requests（首次导入 170ms）。
+    # 不能在开窗前预热：import 是持 GIL 的，放前面只是把等待挪个地方，
+    # 窗口反而还是那么久才出来。放在开窗后，用户还在看界面时它自己就加载好了。
+    QTimer.singleShot(250, lambda: threading.Thread(target=core.warm_up, daemon=True).start())
 
     def shutdown():
         # ⌘Q 退出不会触发窗口的 closeEvent，这里补上取消 + 等线程收尾

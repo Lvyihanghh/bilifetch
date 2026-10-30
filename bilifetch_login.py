@@ -19,7 +19,6 @@
 import time
 from urllib.parse import unquote
 
-import requests
 
 GEN_URL = "https://passport.bilibili.com/x/passport-login/web/qrcode/generate"
 POLL_URL = "https://passport.bilibili.com/x/passport-login/web/qrcode/poll"
@@ -40,11 +39,17 @@ EXPIRED = "expired"      # 二维码失效
 FAILED = "failed"
 
 
+def _req():
+    """requests 延迟导入（见 bilifetch.py 里同样的说明）。"""
+    import requests
+    return requests
+
+
 class QrLogin:
     """一次二维码登录会话。"""
 
     def __init__(self, proxy=None):
-        self.session = requests.Session()
+        self.session = _req().Session()
         self.session.trust_env = False      # 别走系统代理，见 README 里的说明
         if proxy:
             self.session.proxies = {"http": proxy, "https": proxy}
@@ -144,7 +149,7 @@ def check_login_state(cookie="", proxy=None):
     """
     if not cookie:
         return "invalid", ""
-    s = requests.Session()
+    s = _req().Session()
     s.trust_env = False
     if proxy:
         s.proxies = {"http": proxy, "https": proxy}
