@@ -131,7 +131,12 @@ class Cancelled(Exception):
 
 
 def log(msg):
-    print(msg, flush=True)
+    try:
+        print(msg, flush=True)
+    except UnicodeEncodeError:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        print(str(msg).encode("utf-8", "replace").decode("utf-8"), flush=True)
 
 
 def sanitize(name, maxlen=80):

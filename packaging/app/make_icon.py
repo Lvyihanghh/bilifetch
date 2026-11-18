@@ -83,6 +83,8 @@ def build(outdir, scheme="brand"):
 
 
 def main():
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     outdir = sys.argv[1] if len(sys.argv) > 1 else "."
     scheme = sys.argv[2] if len(sys.argv) > 2 else "brand"
     print("图标已生成：%s" % build(outdir, scheme))
