@@ -4,12 +4,12 @@
 
 用户粘的是合集/列表链接时，先弹这个窗口让他预览清单、勾选要下的视频。
 
-设计工程与流畅度优化（遵循 Emil Kowalski Design Engineering & Apple Fluid Interfaces）：
-  1. 列表用 QListView + 自绘 delegate：一百多集只绘制视口内可见的几行。
-  2. 缩略图异步到达时做 180ms --ease-out 柔和渐显（不再一帧生硬跳出）。
+设计工程与无障碍优化（结合 ui-ux-pro-max、design-system、Emil Kowalski 与 Apple HIG）：
+  1. 列表用 QListView + 自绘 delegate，三层语义 Token 原生适配浅色与深色模式。
+  2. 缩略图加载前提供柔和的 Skeleton Shimmer 骨架微光（progressive-loading），到达时 180ms 渐显。
   3. 勾选框与整行支持 pointer-down scale(0.992) 按压反馈，对勾采用左->右 clip-path 扫入动效。
-  4. 视口上下边缘带滚动渐隐遮罩（draw_scroll_edge_fade），消除末行被卡片边框生硬截断的问题。
-  5. 极端数据防御（break-ui）：超长标题双行省略+Tooltip、超长 UP 主名自动省略、搜索无结果空状态提示、等宽数字时长与计数。
+  4. 全键盘导航闭环（WCAG 2.2 AA）：支持 ↑/↓ 移动焦点行、Shift+↑/↓ 连选、Space 切换勾选、⌘F 聚焦搜索与 2px 焦点环。
+  5. 视口上下边缘带滚动渐隐遮罩（draw_scroll_edge_fade），极端数据防御（双行省略+Tooltip、空搜索引导）。
 """
 
 import threading
@@ -17,28 +17,26 @@ import time
 
 from PyQt5.QtCore import (QAbstractListModel, QModelIndex, QRectF, QSize, Qt, QThread, QTimer,
                           pyqtSignal)
-from PyQt5.QtGui import (QColor, QFont, QFontMetrics, QImage, QPainter, QPainterPath,
-                         QPen, QPixmap, QTextLayout)
-from PyQt5.QtWidgets import (QAbstractItemView, QCheckBox, QDialog, QHBoxLayout, QLabel,
-                             QLineEdit, QListView, QSizePolicy, QStyledItemDelegate,
+from PyQt5.QtGui import (QColor, QFont, QFontMetrics, QImage, QKeySequence, QPainter,
+                         QPainterPath, QPen, QPixmap, QTextLayout)
+from PyQt5.QtWidgets import (QAbstractItemView, QAction, QCheckBox, QDialog, QHBoxLayout,
+                             QLabel, QLineEdit, QListView, QSizePolicy, QStyledItemDelegate,
                              QVBoxLayout, QWidget)
 
 import bilifetch_collection as col
 from bilifetch_ui import (ACCENT, ACCENT_SOFT, CARD, FIELD, INK, INK_2, INK_3, Button, Card,
-                          animate_dialog_open, draw_scroll_edge_fade, eval_ease_out,
-                          make_icon, mix, reduced_motion, tabular_font, ui_font)
+                          animate_dialog_open, draw_focus_ring, draw_scroll_edge_fade,
+                          draw_skeleton_shimmer, eval_ease_out, is_dark, make_icon, mix,
+                          reduced_motion, t_color, tabular_font, theme, ui_font)
 
 THUMB_W, THUMB_H = 112, 63
 ROW_H = 80
 COVER_W, COVER_H = 136, 77
 
-# 还没停干净的抓图线程先挂在这里：对话框销毁时不能把它们一起带走
-# （运行中的 QThread 被析构 → Qt abort），等它们自己结束再删。
 _live_threads = []
 
 
 def _release_thread(t):
-    """线程自己跑完了：撤掉引用并删除。"""
     t.wait()
     if t in _live_threads:
         _live_threads.remove(t)
@@ -48,19 +46,17 @@ def _release_thread(t):
         pass
 
 
-# 读取合集用的客户端，由主窗口在打开对话框前设置（这样能用上 Cookie / 代理）
 collection_client = None
 
 
 class ElidedTitleLabel(QWidget):
     """最多显示两行的标题控件（单行时紧凑贴合，双行时自动增高，超出第 2 行末尾优雅省略并附带完整 Tooltip）。"""
 
-    def __init__(self, text="", max_lines=2, font=None, color=INK, parent=None):
+    def __init__(self, text="", max_lines=2, font=None, parent=None):
         super().__init__(parent)
         self._text = str(text or "")
         self._max_lines = max_lines
         self._font = font or ui_font(20, QFont.Bold)
-        self._color = QColor(color)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         fm = QFontMetrics(self._font)
         self._line_h = fm.lineSpacing() + 2
@@ -93,7 +89,7 @@ class ElidedTitleLabel(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         p.setFont(self._font)
-        p.setPen(self._color)
+        p.setPen(QColor(t_color("ink")))
         fm = QFontMetrics(self._font)
         w = max(40, self.width())
         if not self._lines:
@@ -109,13 +105,53 @@ class ElidedTitleLabel(QWidget):
         p.end()
 
 
-class CoverThread(QThread):
-    """后台批量抓缩略图。
+class CoverBox(QWidget):
+    """头部合集封面：未加载完时显示圆角骨架微光，加载完成后 180ms 渐显。"""
 
-    用线程池并发抓（一张图 ~200ms，串行抓 91 张要等十几秒）；
-    每个工作线程复用自己的 Session（以前每张图新建一个 Session，连接都没法复用）。
-    缩放也在后台做好，按 2x 出图，Retina 上不糊；QPixmap 必须在界面线程建，所以传 QImage。
-    """
+    def __init__(self, w=COVER_W, h=COVER_H, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(w, h)
+        self._pm = None
+        self._load_t = 0.0
+        self._shimmer_phase = 0.0
+
+    def setPixmap(self, pm):
+        self._pm = pm
+        self._load_t = time.monotonic()
+        self.update()
+
+    def setShimmerPhase(self, phase):
+        if self._pm is None:
+            self._shimmer_phase = phase
+            self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = QRectF(self.rect())
+        now = time.monotonic()
+        prog = eval_ease_out((now - self._load_t) / 0.18) if (
+            self._pm is not None and 0.0 <= now - self._load_t < 0.18 and not reduced_motion()
+        ) else 1.0
+
+        if self._pm is None or prog < 1.0:
+            draw_skeleton_shimmer(p, r, 10.0, self._shimmer_phase)
+            p.drawPixmap(int(r.center().x() - 11), int(r.center().y() - 11),
+                         make_icon("play", t_color("ink_3"), 22))
+        if self._pm is not None:
+            p.save()
+            path = QPainterPath()
+            path.addRoundedRect(r, 10.0, 10.0)
+            p.setClipPath(path)
+            if prog < 1.0:
+                p.setOpacity(prog)
+            p.drawPixmap(0, 0, self._pm)
+            p.restore()
+        p.end()
+
+
+class CoverThread(QThread):
+    """后台批量抓缩略图。"""
 
     WORKERS = 8
 
@@ -123,7 +159,7 @@ class CoverThread(QThread):
 
     def __init__(self, urls, parent=None, size=(THUMB_W, THUMB_H), dpr=2.0):
         super().__init__(parent)
-        self.urls = urls          # [(index, url)]
+        self.urls = urls
         self.size = size
         self.dpr = dpr
         self._stop = False
@@ -147,7 +183,6 @@ class CoverThread(QThread):
         if self._stop:
             return None
         w0, h0 = int(self.size[0] * self.dpr), int(self.size[1] * self.dpr)
-        # B 站图床支持按尺寸出缩略图，省掉下载 1080P 原图（几百 KB → 十几 KB）
         if "hdslb.com" in url and "@" not in url:
             url = url.replace("http://", "https://") + "@%dw_%dh_1c.jpg" % (w0, h0)
         r = self._session().get(url, timeout=10)
@@ -175,10 +210,9 @@ class CoverThread(QThread):
                 if img is not None:
                     self.ready.emit(futures[fut], img)
         finally:
-            # 不用 with：with 退出时会等所有在途请求跑完，对话框关了还得等半天
             try:
                 pool.shutdown(wait=False, cancel_futures=True)
-            except TypeError:          # 老版本 Python 没有 cancel_futures
+            except TypeError:
                 pool.shutdown(wait=False)
 
 
@@ -269,7 +303,7 @@ class ItemModel(QAbstractListModel):
 
 
 class ItemDelegate(QStyledItemDelegate):
-    """一行：勾选框（带 clip-path 扫入动效）+ 缩略图（带渐显）+ 标题 + 时长/播放量。"""
+    """一行：勾选框（带 clip-path 扫入动效）+ 缩略图（带骨架微光与渐显）+ 标题 + 时长/播放量。"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -278,6 +312,8 @@ class ItemDelegate(QStyledItemDelegate):
         self.f_badge = tabular_font(10, QFont.DemiBold)
         self.hover_row = -1
         self.press_row = -1
+        self.focus_row = -1
+        self.shimmer_phase = 0.0
 
     def sizeHint(self, option, index):
         return QSize(option.rect.width(), ROW_H)
@@ -285,6 +321,7 @@ class ItemDelegate(QStyledItemDelegate):
     def paint(self, p, option, index):
         p.save()
         p.setRenderHint(QPainter.Antialiasing)
+        t = theme()
         r = QRectF(option.rect)
         checked = index.data(ItemModel.CheckRole)
         item = index.data(ItemModel.ItemRole) or {}
@@ -293,7 +330,6 @@ class ItemDelegate(QStyledItemDelegate):
 
         card = r.adjusted(6, 3, -6, -3)
 
-        # 按压微缩放反馈（pointer-down scale(0.992)）
         if row == self.press_row and not reduced_motion():
             p.translate(card.center())
             p.scale(0.992, 0.992)
@@ -303,19 +339,23 @@ class ItemDelegate(QStyledItemDelegate):
         dt_chk = now - check_t
         chk_prog = eval_ease_out(dt_chk / 0.16) if (0.0 <= dt_chk < 0.16 and not reduced_motion()) else 1.0
 
-        # 背景：悬停浅灰，选中浅粉（带柔和色彩过渡）
+        is_focus = (row == self.focus_row and self.parent() and self.parent().hasFocus())
+
         if checked or chk_prog < 1.0:
             t_bg = chk_prog if checked else (1.0 - chk_prog)
-            base_bg = "#F6F7F8" if row == self.hover_row else "#FFFFFF"
+            base_bg = t["row_hover"] if row == self.hover_row else t["card"]
             p.setPen(Qt.NoPen)
-            p.setBrush(mix(base_bg, ACCENT_SOFT, t_bg))
+            p.setBrush(mix(base_bg, t["accent_soft"], t_bg))
             p.drawRoundedRect(card, 10, 10)
-        elif row == self.hover_row:
+        elif row == self.hover_row or is_focus:
             p.setPen(Qt.NoPen)
-            p.setBrush(QColor("#F6F7F8"))
+            p.setBrush(QColor(t["row_hover"]))
             p.drawRoundedRect(card, 10, 10)
 
-        # 勾选框（按压内缩 + 对勾从左至右 clip-path 绘制）
+        if is_focus:
+            draw_focus_ring(p, card, 10)
+
+        # 勾选框
         cb = QRectF(card.left() + 12, card.center().y() - 9, 18, 18)
         p.save()
         if row == self.press_row and not reduced_motion():
@@ -324,22 +364,21 @@ class ItemDelegate(QStyledItemDelegate):
             p.translate(-cb.center())
         if checked:
             p.setPen(Qt.NoPen)
-            p.setBrush(mix("#FFFFFF", ACCENT, chk_prog))
+            p.setBrush(mix(t["card"], t["accent"], chk_prog))
             p.drawRoundedRect(cb, 5, 5)
-            # Choreograph 规范：方框落定同时对勾由左向右扫出
             ic_rect = cb.adjusted(1, 1, -1, -1)
             if chk_prog < 1.0:
                 p.setClipRect(QRectF(ic_rect.left(), ic_rect.top(),
                                      ic_rect.width() * chk_prog, ic_rect.height()))
             p.drawPixmap(ic_rect.toRect(), make_icon("check", "#FFFFFF", 16))
         else:
-            border_c = ACCENT if row == self.hover_row else "#C9CCD0"
+            border_c = t["accent"] if (row == self.hover_row or is_focus) else t["ink_3"]
             p.setPen(QPen(QColor(border_c), 1.5))
-            p.setBrush(QColor("#FFFFFF"))
+            p.setBrush(QColor(t["card"]))
             p.drawRoundedRect(cb.adjusted(0.75, 0.75, -0.75, -0.75), 5, 5)
         p.restore()
 
-        # 缩略图（异步加载完成时 180ms 渐显）
+        # 缩略图（未到达时显示柔和 Skeleton Shimmer，到达后 180ms 渐显）
         th = QRectF(cb.right() + 14, card.center().y() - THUMB_H / 2.0, THUMB_W, THUMB_H)
         path = QPainterPath()
         path.addRoundedRect(th, 7, 7)
@@ -349,9 +388,9 @@ class ItemDelegate(QStyledItemDelegate):
         th_prog = eval_ease_out(dt_th / 0.18) if (pm is not None and 0.0 <= dt_th < 0.18 and not reduced_motion()) else 1.0
 
         if pm is None or th_prog < 1.0:
-            p.fillPath(path, QColor(FIELD))
+            draw_skeleton_shimmer(p, th, 7.0, self.shimmer_phase if item.get("pic") else 0.0)
             p.drawPixmap(int(th.center().x() - 9), int(th.center().y() - 9),
-                         make_icon("play", "#C9CCD0", 18))
+                         make_icon("play", t["ink_3"], 18))
         if pm is not None:
             p.save()
             p.setClipPath(path)
@@ -367,18 +406,18 @@ class ItemDelegate(QStyledItemDelegate):
             bw = fm.horizontalAdvance(txt) + 10
             br = QRectF(th.right() - bw - 4, th.bottom() - 18, bw, 14)
             p.setPen(Qt.NoPen)
-            p.setBrush(QColor(15, 20, 30, 165))
+            p.setBrush(QColor(15, 20, 30, 175))
             p.drawRoundedRect(br, 4, 4)
             p.setPen(QColor("#FFFFFF"))
             p.drawText(br, Qt.AlignCenter, txt)
 
         # 文字
         tx = th.right() + 14
-        tw = card.right() - tx - 14
+        tw = max(40.0, card.right() - tx - 14)
         title = index.data(Qt.DisplayRole) or ""
         p.setFont(self.f_title)
         fm = QFontMetrics(self.f_title)
-        p.setPen(QColor(INK))
+        p.setPen(QColor(t["ink"]))
         meta = index.model().meta[row] if hasattr(index.model(), "meta") else ""
         if item.get("current"):
             meta = ("当前  ·  " + meta) if meta else "当前"
@@ -387,7 +426,7 @@ class ItemDelegate(QStyledItemDelegate):
         p.drawText(QRectF(tx, ty, tw, fm.height()), Qt.AlignLeft | Qt.AlignVCenter,
                    fm.elidedText(title, Qt.ElideRight, int(tw)))
         p.setFont(self.f_meta)
-        p.setPen(QColor(ACCENT if item.get("current") else INK_3))
+        p.setPen(QColor(t["accent"] if item.get("current") else t["ink_3"]))
         fm2 = QFontMetrics(self.f_meta)
         p.drawText(QRectF(tx, ty + fm.height() + 6, tw, fm2.height()),
                    Qt.AlignLeft | Qt.AlignVCenter,
@@ -396,13 +435,14 @@ class ItemDelegate(QStyledItemDelegate):
 
 
 class ItemView(QListView):
-    """点击整行切换勾选；按住 Shift 点击可以连选一段；支持空搜索提示与滚动边缘渐隐。"""
+    """支持鼠标点击/Shift连选 + 键盘 ↑/↓ 选行、Shift+↑/↓ 连选、Space 切换勾选；支持空搜索提示与滚动边缘渐隐。"""
 
     toggled = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.TabFocus)
         self.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.verticalScrollBar().setSingleStep(24)
         self.setSelectionMode(QAbstractItemView.NoSelection)
@@ -416,6 +456,56 @@ class ItemView(QListView):
             self._empty_filtered = bool(empty)
             self.viewport().update()
 
+    def _visible_rows(self):
+        m = self.model()
+        if not m:
+            return []
+        return [i for i in range(m.rowCount()) if not self.isRowHidden(i)]
+
+    def focusInEvent(self, e):
+        super().focusInEvent(e)
+        d = self.itemDelegate()
+        vis = self._visible_rows()
+        if vis and d.focus_row not in vis:
+            d.focus_row = vis[0]
+        if d.focus_row >= 0:
+            self.update(self.model().index(d.focus_row))
+
+    def focusOutEvent(self, e):
+        super().focusOutEvent(e)
+        d = self.itemDelegate()
+        if d.focus_row >= 0:
+            self.update(self.model().index(d.focus_row))
+
+    def keyPressEvent(self, e):
+        vis = self._visible_rows()
+        d = self.itemDelegate()
+        m = self.model()
+        key = e.key()
+        if key in (Qt.Key_Down, Qt.Key_Up) and vis:
+            cur = d.focus_row if d.focus_row in vis else vis[0]
+            idx = vis.index(cur)
+            nxt = vis[min(len(vis) - 1, idx + 1)] if key == Qt.Key_Down else vis[max(0, idx - 1)]
+            old = d.focus_row
+            d.focus_row = nxt
+            if e.modifiers() & Qt.ShiftModifier:
+                val = m.checked[cur]
+                m.set_checked([nxt], val)
+                self.toggled.emit()
+            for r in {old, nxt}:
+                if r >= 0:
+                    self.update(m.index(r))
+            self.scrollTo(m.index(nxt))
+            e.accept()
+            return
+        if key == Qt.Key_Space and d.focus_row in vis:
+            m.toggle(d.focus_row)
+            self._anchor = d.focus_row
+            self.toggled.emit()
+            e.accept()
+            return
+        super().keyPressEvent(e)
+
     def mousePressEvent(self, e):
         if e.button() != Qt.LeftButton:
             return super().mousePressEvent(e)
@@ -423,7 +513,11 @@ class ItemView(QListView):
         if not ix.isValid():
             return
         d = self.itemDelegate()
+        old_f = d.focus_row
+        d.focus_row = ix.row()
         d.press_row = ix.row()
+        if old_f >= 0:
+            self.update(self.model().index(old_f))
         self.update(ix)
 
     def mouseReleaseEvent(self, e):
@@ -449,7 +543,7 @@ class ItemView(QListView):
         self.toggled.emit()
 
     def mouseDoubleClickEvent(self, e):
-        self.mousePressEvent(e)     # 双击当两次单击处理，别吞掉
+        self.mousePressEvent(e)
 
     def mouseMoveEvent(self, e):
         ix = self.indexAt(e.pos())
@@ -479,27 +573,23 @@ class ItemView(QListView):
         p = QPainter(self.viewport())
         p.setRenderHint(QPainter.Antialiasing)
         if self._empty_filtered:
-            # break-ui 空结果态：搜索无匹配时给出清晰引导
             vr = self.viewport().rect()
             cx, cy = vr.width() / 2.0, vr.height() / 2.0 - 12
-            p.drawPixmap(int(cx - 12), int(cy - 28), make_icon("search", INK_3, 24))
-            p.setPen(QColor(INK_2))
+            p.drawPixmap(int(cx - 12), int(cy - 28), make_icon("search", t_color("ink_3"), 24))
+            p.setPen(QColor(t_color("ink_2")))
             p.setFont(ui_font(14, QFont.Medium))
             p.drawText(QRectF(0, cy + 4, vr.width(), 22), Qt.AlignCenter, "没有找到匹配的剧集")
-            p.setPen(QColor(INK_3))
+            p.setPen(QColor(t_color("ink_3")))
             p.setFont(ui_font(12))
             p.drawText(QRectF(0, cy + 28, vr.width(), 18), Qt.AlignCenter, "试试其他关键词，或清空搜索框")
         else:
-            draw_scroll_edge_fade(p, self.viewport().rect(), self.verticalScrollBar(), CARD, 28)
+            draw_scroll_edge_fade(p, self.viewport().rect(), self.verticalScrollBar(), t_color("card"), 28)
         p.end()
 
 
 # ---------------------------------------------------------------- 对话框
 class CollectionDialog(QDialog):
-    """浏览 / 预览窗口：读出清单 -> 勾选 -> 确认下载。
-
-    合集/列表/收藏夹会列出全部视频；单个视频会列出它的各个分 P。
-    """
+    """浏览 / 预览窗口：读出清单 -> 勾选 -> 确认下载。"""
 
     def __init__(self, info=None, url="", parent=None):
         super().__init__(parent)
@@ -512,20 +602,18 @@ class CollectionDialog(QDialog):
         self._threads = []
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(22, 22, 22, 18)
+        root.setContentsMargins(24, 22, 24, 18)
         root.setSpacing(14)
 
         # ---- 头部：封面 + 名称（横排）----
         head = QHBoxLayout()
         head.setSpacing(16)
-        self.cover = QLabel()
-        self.cover.setFixedSize(COVER_W, COVER_H)
-        self.cover.setStyleSheet("background:%s; border-radius:10px;" % FIELD)
+        self.cover = CoverBox(COVER_W, COVER_H)
         head.addWidget(self.cover, 0, Qt.AlignTop)
         tbox = QVBoxLayout()
         tbox.setSpacing(6)
         title_str = self.info.get("title") or "合集"
-        t = ElidedTitleLabel(title_str, max_lines=2, font=ui_font(19, QFont.Bold), color=INK)
+        t = ElidedTitleLabel(title_str, max_lines=2, font=ui_font(19, QFont.Bold))
         tbox.addWidget(t)
         owner = self.info.get("owner") or ""
         bits = [self.info.get("kind_label", "合集"),
@@ -548,13 +636,13 @@ class CollectionDialog(QDialog):
         tools.setSpacing(8)
         self.search = QLineEdit()
         self.search.setObjectName("search")
-        self.search.setPlaceholderText("搜索标题")
+        self.search.setPlaceholderText("搜索标题（⌘F）")
         self.search.setClearButtonEnabled(True)
         self.search.addAction(_icon_action(self.search), QLineEdit.LeadingPosition)
         self.search.setFixedWidth(240)
         self._filter_timer = QTimer(self)
         self._filter_timer.setSingleShot(True)
-        self._filter_timer.setInterval(120)          # 打字时别每个键都重排一遍
+        self._filter_timer.setInterval(120)
         self._filter_timer.timeout.connect(self._filter)
         self.search.textChanged.connect(lambda _t: self._filter_timer.start())
         tools.addWidget(self.search)
@@ -577,15 +665,16 @@ class CollectionDialog(QDialog):
         card = Card(padding=(4, 6, 4, 6))
         self.model = ItemModel(items, self)
         self.view = ItemView()
-        self.view.setItemDelegate(ItemDelegate(self.view))
+        self.delegate = ItemDelegate(self.view)
+        self.view.setItemDelegate(self.delegate)
         self.view.setModel(self.model)
         self.view.toggled.connect(self._on_user_toggled)
         card.layout.addWidget(self.view)
         root.addWidget(card, 1)
         self._apply_visibility()
-        # 打开时滚到「当前这一集」
         for i, it in enumerate(items):
             if it.get("current"):
+                self.delegate.focus_row = i
                 QTimer.singleShot(0, lambda i=i: self.view.scrollTo(
                     self.model.index(i), QAbstractItemView.PositionAtCenter))
                 break
@@ -611,13 +700,18 @@ class CollectionDialog(QDialog):
         bottom.addWidget(self.ok)
         root.addLayout(bottom)
 
-        # 共享动效定时器：用于驱动勾选与缩略图渐显，无动画时自动休眠
+        # 快捷键 ⌘F 聚焦搜索框
+        find_act = QAction(self)
+        find_act.setShortcut(QKeySequence("Ctrl+F"))
+        find_act.triggered.connect(lambda: (self.search.setFocus(), self.search.selectAll()))
+        self.addAction(find_act)
+
         self._fx_timer = QTimer(self)
         self._fx_timer.setInterval(16)
         self._fx_timer.timeout.connect(self._tick_fx)
 
         self._update_count()
-        self.view.setFocus()          # 别让搜索框一打开就抢焦点（会亮起粉色边框）
+        self.view.setFocus()
         animate_dialog_open(self)
         QTimer.singleShot(0, self._load_covers)
 
@@ -628,6 +722,16 @@ class CollectionDialog(QDialog):
     def _tick_fx(self):
         now = time.monotonic()
         active = False
+        loading_any = any(t.isRunning() for t in self._threads)
+        if loading_any and not reduced_motion():
+            phase = (now * 0.85) % 1.0
+            self.delegate.shimmer_phase = phase
+            self.cover.setShimmerPhase(phase)
+            self.view.viewport().update()
+            active = True
+        if self.cover._load_t and now - self.cover._load_t < 0.20:
+            self.cover.update()
+            active = True
         for i in range(len(self.model.items)):
             if self.view.isRowHidden(i):
                 continue
@@ -708,6 +812,7 @@ class CollectionDialog(QDialog):
         t.ready.connect(slot)
         self._threads.append(t)
         t.start()
+        self._start_fx()
 
     def _load_covers(self, extra=False):
         items = self.model.items
@@ -718,7 +823,6 @@ class CollectionDialog(QDialog):
         urls = [(i, it.get("pic")) for i, it in enumerate(items)
                 if it.get("pic") and bool(it.get("extra")) == extra
                 and self.model.thumbs[i] is None]
-        # 同一张图（单视频的多个分 P 共用封面）只抓一次
         seen = {}
         uniq = []
         for i, u in urls:
@@ -734,19 +838,8 @@ class CollectionDialog(QDialog):
     def _on_cover(self, _idx, img):
         pm = QPixmap.fromImage(img)
         pm.setDevicePixelRatio(img.width() / float(COVER_W))
-        # 圆角
-        out = QPixmap(pm.size())
-        out.setDevicePixelRatio(pm.devicePixelRatio())
-        out.fill(Qt.transparent)
-        p = QPainter(out)
-        p.setRenderHint(QPainter.Antialiasing)
-        path = QPainterPath()
-        path.addRoundedRect(QRectF(0, 0, COVER_W, COVER_H), 10, 10)
-        p.setClipPath(path)
-        p.drawPixmap(0, 0, pm)
-        p.end()
-        self.cover.setStyleSheet("")
-        self.cover.setPixmap(out)
+        self.cover.setPixmap(pm)
+        self._start_fx()
 
     def _on_thumb(self, idx, img):
         pm = QPixmap.fromImage(img)
@@ -760,15 +853,9 @@ class CollectionDialog(QDialog):
 
     @property
     def audio_only(self):
-        """只下音频（在浏览窗口里勾）。"""
         return self.chk_audio.isChecked()
 
     def _stop_threads(self):
-        """停掉后台抓图线程。
-
-        抓图线程可能正卡在网络请求上，**运行中的 QThread 被析构会让 Qt 直接 abort**，
-        所以等不干净时要把它从父子关系里摘出来、Python 侧继续持有引用，等它自己跑完再删。
-        """
         for t in self._threads:
             t.stop()
             try:
@@ -792,4 +879,4 @@ class CollectionDialog(QDialog):
 def _icon_action(parent):
     from PyQt5.QtWidgets import QAction
     from PyQt5.QtGui import QIcon
-    return QAction(QIcon(make_icon("search", INK_3, 16)), "", parent)
+    return QAction(QIcon(make_icon("search", t_color("ink_3"), 16)), "", parent)

@@ -2,13 +2,10 @@
 # -*- coding: utf-8 -*-
 """B 站扫码登录对话框。
 
-以前取二维码、轮询、查昵称全在界面线程里做：每 2 秒一次网络请求，
-网络稍慢窗口就僵住（最长 15 秒）。现在全部放到后台线程，界面只收结果。
-
-设计工程与动效升级（Emil Kowalski Design Engineering）：
+设计工程与无障碍升级（结合 ui-ux-pro-max、design-system 与 Emil Kowalski）：
+  * 三层语义 Token 原生适配浅色与深色模式，二维码区自身保持白色高对比扫描底衬以保证手机识别率。
   * 二维码加载完成时采用 scale(0.95) -> scale(1.0) + opacity(0 -> 1) 的 180ms --ease-out 入场。
-  * 已扫码 / 二维码失效 / 登录成功时，二维码上方柔和浮现半透明磨砂遮罩与矢量状态徽章，
-    让状态切换清晰直观，不再靠生硬清掉图片写纯文字。
+  * 已扫码 / 二维码失效 / 登录成功时，二维码上方柔和浮现半透明磨砂遮罩与矢量状态徽章。
 """
 
 from PyQt5.QtCore import QPointF, QRectF, Qt, QThread, QTimer, QVariantAnimation, pyqtSignal
@@ -17,10 +14,10 @@ from PyQt5.QtWidgets import QDialog, QLabel, QVBoxLayout, QWidget
 
 import bilifetch_login as login_mod
 from bilifetch_ui import (ACCENT, FIELD, GREEN, INK, INK_2, INK_3, LINE, Button, Card,
-                          Spinner, animate_dialog_open, ease_out, make_icon,
-                          reduced_motion, ui_font)
+                          Spinner, animate_dialog_open, ease_out, is_dark, make_icon,
+                          reduced_motion, t_color, theme, ui_font)
 
-_orphans = []     # 对话框关了但线程还在等网络：先挂在这里，跑完再释放
+_orphans = []
 
 
 class QrThread(QThread):
@@ -154,9 +151,11 @@ class QrBox(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         r = QRectF(self.rect())
+        t = theme()
 
-        p.setPen(QPen(QColor(LINE if self._pm else "transparent"), 1))
-        p.setBrush(QColor("#FFFFFF" if self._pm else FIELD))
+        # 二维码一旦生成，底板始终保持纯白，确保深色模式下手机摄像头也能瞬间识别
+        p.setPen(QPen(QColor(t["line"] if self._pm else "transparent"), 1))
+        p.setBrush(QColor("#FFFFFF" if self._pm else t["field"]))
         p.drawRoundedRect(r.adjusted(0.5, 0.5, -0.5, -0.5), 12, 12)
 
         if self._pm is not None:
@@ -176,7 +175,7 @@ class QrBox(QWidget):
             p.setOpacity(self._overlay_prog)
             path = QPainterPath()
             path.addRoundedRect(r.adjusted(1, 1, -1, -1), 11, 11)
-            p.fillPath(path, QColor(255, 255, 255, 228))
+            p.fillPath(path, QColor(24, 27, 34, 232) if is_dark() else QColor(255, 255, 255, 232))
 
             cx, cy = r.center().x(), r.center().y() - 10
             if not reduced_motion():
@@ -188,17 +187,18 @@ class QrBox(QWidget):
             badge = QRectF(cx - 22, cy - 22, 44, 44)
             p.setPen(Qt.NoPen)
             if self._overlay_mode in ("scanned", "done"):
-                p.setBrush(QColor("#E9F8F0"))
+                fg, soft = t["state_colors"]["done"]
+                p.setBrush(QColor(soft))
                 p.drawEllipse(badge)
-                p.drawPixmap(QPointF(cx - 11, cy - 11), make_icon("check", GREEN, 22))
+                p.drawPixmap(QPointF(cx - 11, cy - 11), make_icon("check", fg, 22))
                 label = "登录成功" if self._overlay_mode == "done" else "已扫码，待手机确认"
-                col = INK
+                col = t["ink"]
             else:
-                p.setBrush(QColor(FIELD))
+                p.setBrush(QColor(t["field"]))
                 p.drawEllipse(badge)
-                p.drawPixmap(QPointF(cx - 10, cy - 10), make_icon("retry", INK_2, 20))
+                p.drawPixmap(QPointF(cx - 10, cy - 10), make_icon("retry", t["ink_2"], 20))
                 label = "二维码已失效"
-                col = INK_2
+                col = t["ink_2"]
 
             p.setPen(QColor(col))
             p.setFont(ui_font(13, QFont.DemiBold))
@@ -282,8 +282,6 @@ class LoginDialog(QDialog):
         if not pm.loadFromData(png):
             self._on_failed("二维码图片解码失败")
             return
-        # 二维码原图 400 多像素，不缩放的话 QLabel 会裁掉一截（手机扫不出来）。
-        # 按 2x 缩到刚好填满，Retina 上也清晰。
         dpr = 2.0
         side = self.qr.width() - 16
         pm = pm.scaled(int(side * dpr), int(side * dpr), Qt.KeepAspectRatio,
@@ -331,7 +329,6 @@ class LoginDialog(QDialog):
             except TypeError:
                 pass
         if not t.wait(200):
-            # 还卡在网络请求上：别在界面线程干等，摘出来让它自己跑完
             t.setParent(None)
             _orphans.append(t)
             t.finished.connect(lambda th=t: _release(th))

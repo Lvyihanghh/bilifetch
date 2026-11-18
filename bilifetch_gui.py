@@ -7,21 +7,15 @@ BiliFetch 图形界面（PyQt5）
 只是把命令行换成了窗口。
 
 单独运行：python3 bilifetch_gui.py
+压力测试：python3 bilifetch_gui.py --break-ui
 打包后自检：BiliFetch --selftest <链接> <输出目录>
 
-界面结构：
-  顶栏      Logo + 账号 + 设置
-  输入卡    链接输入 + 解析；保存位置 + 画质
-  队列卡    下载 / 日志 两个分段；队列是 QListView + 自绘 delegate
-
-流畅度与设计工程关键点（Emil Kowalski Design Engineering & Apple Fluid Interfaces）：
-  * 下载是一个常驻的后台队列：下载过程中可以继续解析别的链接，新任务直接排到队尾，
-    不用等上一批结束，也不再有"停止 -> 等线程 -> 再开始"的一串排队状态。
-  * 进度信号只改数据，不直接重绘；由一个共享的 16ms 动画定时器把进度条平滑推到目标值，
-    只在有行在动的时候运行，只重绘在动的那几行。
-  * 速度每 0.5 秒统一算一次（指数平滑），配合等宽数字（tabular-nums）读数稳而不抖。
-  * 列表悬停即显快捷操作胶囊（定位 / 重试 / 取消），上下滚动边缘带柔和渐隐遮罩。
-  * 底部 Sonner 风格 Toast：带语义图标、底部滑入/滑出空间一致性、悬停暂停计时、点击即关。
+界面结构与 UX 升级（遵循 ui-ux-pro-max、design-system、Emil Kowalski 与 Apple HIG）：
+  * 顶栏：Logo + 账号胶囊 + 主题切换（浅色/深色）+ 设置
+  * 输入卡：链接输入（实时识别链接类型胶囊 + 行内错误校验与一键重试，告别弹窗打断）+ 解析；保存位置 + 画质
+  * 队列卡：下载 / 日志 分段 + 状态筛选胶囊（全部 / 进行中 / 已完成 / 失败）；
+            支持全键盘操作（↑/↓ 选行、Enter 打开/重试、Delete 取消/移除）与 2px 无障碍焦点环
+  * 压力测试（Break UI）：支持 Ctrl+Shift+B 或 --break-ui 一键切换「常规 / 极端数据 / 空状态 / 单条 / 1000行压测」
 """
 
 import collections
@@ -36,14 +30,15 @@ import time
 import traceback
 
 from PyQt5.QtCore import (QAbstractListModel, QByteArray, QEvent, QModelIndex,
-                          QPointF, QRectF, QSize, Qt, QThread, QTimer, QVariantAnimation,
-                          pyqtSignal)
+                          QPoint, QPointF, QPropertyAnimation, QRectF, QSize, Qt,
+                          QThread, QTimer, QVariantAnimation, pyqtSignal)
 from PyQt5.QtGui import (QColor, QFont, QFontMetrics, QIcon, QKeySequence, QPainter,
                          QPainterPath, QPen, QPixmap)
 from PyQt5.QtWidgets import (QAbstractItemView, QAction, QApplication, QDialog,
                              QFileDialog, QHBoxLayout, QLabel, QLineEdit, QListView,
                              QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
-                             QStackedWidget, QStyledItemDelegate, QVBoxLayout, QWidget)
+                             QSizePolicy, QStackedWidget, QStyledItemDelegate,
+                             QVBoxLayout, QWidget)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bilifetch as core          # noqa: E402
@@ -56,8 +51,9 @@ from bilifetch_ui import (ACCENT, ACCENT_SOFT, BLUE, CARD, DUR_POPOVER, DUR_TOAS
                           DUR_TOAST_OUT, FIELD, GREEN, INK, INK_2, INK_3, LINE, ORANGE,
                           QSS, RED, STATE_COLORS, TRACK, AccountChip, Button, Card,
                           ComboBox, IconButton, LogoTile, Segmented, animate_dialog_open,
-                          draw_fox, draw_scroll_edge_fade, ease_out, eval_ease_out,
-                          make_icon, mix, reduced_motion, tabular_font, ui_font)
+                          draw_focus_ring, draw_fox, draw_scroll_edge_fade, ease_out,
+                          eval_ease_out, is_dark, make_icon, mix, reduced_motion,
+                          set_theme, state_colors, t_color, tabular_font, theme, ui_font)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -76,6 +72,26 @@ QUALITY_CHOICES = [
 # 识别剪贴板里的 B 站链接 / ID
 LINK_RE = re.compile(r"(bilibili\.com/|b23\.tv/|^BV[0-9A-Za-z]{10}$|^av\d+$|^(ep|ss)\d+$)",
                      re.I)
+
+
+def classify_link(text):
+    """实时识别输入链接的类型，返回 (类型标签, 语义色key) 或 None。"""
+    s = (text or "").strip()
+    if not s:
+        return None
+    if re.search(r"(bangumi/play/(ep|ss)\d+|^(ep|ss)\d+$)", s, re.I):
+        return ("番剧 / 剧集", "orange")
+    if re.search(r"(favlist|fid=\d+)", s, re.I):
+        return ("收藏夹", "blue")
+    if re.search(r"(/lists/|seriesdetail|season_id=\d+|medialist)", s, re.I):
+        return ("合集 / 列表", "blue")
+    if re.search(r"b23\.tv/", s, re.I):
+        return ("b23 短链", "accent")
+    if re.search(r"(bilibili\.com/video/|^BV[0-9A-Za-z]{10}$|^av\d+$)", s, re.I):
+        return ("视频", "green")
+    if "bilibili.com" in s.lower():
+        return ("B 站链接", "accent")
+    return None
 
 
 def load_app_icon():
@@ -134,11 +150,7 @@ def open_path(path):
 
 # ---------------------------------------------------------------- 后台下载
 class DownloadThread(QThread):
-    """常驻的下载队列线程。
-
-    界面随时可以 add() 新任务；队列空了线程自己结束。
-    add() 和"队列空 -> 结束"在同一把锁里判断，不会出现任务加进去却没人下的情况。
-    """
+    """常驻的下载队列线程。"""
 
     log_line = pyqtSignal(str)
     job_started = pyqtSignal(int)
@@ -164,7 +176,6 @@ class DownloadThread(QThread):
         self._current = None
         self._client = None
 
-    # ---- 界面线程调用 ----
     def add(self, jobs):
         """加任务。线程已经在收尾（不再接活）时返回 False。"""
         with self._lock:
@@ -191,8 +202,6 @@ class DownloadThread(QThread):
         self._abort_network()
 
     def _abort_network(self):
-        # 光置标志不够：卡在 socket 读上的请求要等到超时才会看标志，
-        # 直接把连接掐断，"停止"才会立刻生效。
         c = self._client
         if c is not None:
             try:
@@ -203,7 +212,6 @@ class DownloadThread(QThread):
     def _should_stop(self):
         return self._cancel_all or self._cancel_current
 
-    # ---- 后台线程 ----
     def run(self):
         try:
             self._client = core.BiliClient(cookie=self.cookie, proxy=self.proxy or None)
@@ -229,13 +237,12 @@ class DownloadThread(QThread):
                 self._cancel_current = False
             try:
                 self._run_job(job, ffmpeg)
-            except Exception as e:          # 兜底：一个任务出错不能把整个队列带崩
+            except Exception as e:
                 self.job_failed.emit(job["id"], str(e))
             with self._lock:
                 self._current = None
 
     def _expand(self, job):
-        """把任务展开成具体的 [(文件名, bvid, cid)]。"""
         client = self._client
         if job.get("url"):
             info = client.resolve(job["url"])
@@ -310,7 +317,7 @@ class DownloadThread(QThread):
 
 
 class LoginCheckThread(QThread):
-    """后台查登录态（以前在主线程查，开窗那一下整个界面是僵的）。"""
+    """后台查登录态。"""
 
     done = pyqtSignal(str, str)      # 状态(ok/invalid/error), 昵称
 
@@ -328,7 +335,7 @@ class LoginCheckThread(QThread):
 
 
 class PreviewThread(QThread):
-    """后台读链接内容（要打 B 站好几个接口，放界面线程里窗口会完全僵住）。"""
+    """后台读链接内容。"""
 
     done = pyqtSignal(object)
     failed = pyqtSignal(str)
@@ -346,6 +353,85 @@ class PreviewThread(QThread):
             self.done.emit(collection.fetch_preview(client, self.url))
         except Exception as e:
             self.failed.emit(str(e))
+
+
+# ---------------------------------------------------------------- 行内链接识别徽章与错误提示条
+class LinkBadge(QWidget):
+    """实时显示识别到的链接类型胶囊（如 番剧 / 视频 / 合集 / 短链）。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._label = ""
+        self._color_key = "accent"
+        self._font = ui_font(11, QFont.DemiBold)
+        self.setFixedHeight(22)
+        self.hide()
+
+    def setKind(self, info):
+        if not info:
+            self._label = ""
+            self.hide()
+            return
+        label, color_key = info
+        self._label = label
+        self._color_key = color_key
+        fm = QFontMetrics(self._font)
+        self.setFixedWidth(fm.horizontalAdvance(label) + 18)
+        self.show()
+        self.update()
+
+    def paintEvent(self, e):
+        if not self._label:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = QRectF(self.rect())
+        c = QColor(t_color(self._color_key))
+        bg = QColor(c)
+        bg.setAlpha(38 if is_dark() else 26)
+        p.setPen(Qt.NoPen)
+        p.setBrush(bg)
+        p.drawRoundedRect(r, r.height() / 2.0, r.height() / 2.0)
+        p.setFont(self._font)
+        p.setPen(c)
+        p.drawText(r, Qt.AlignCenter, self._label)
+        p.end()
+
+
+class InlineNotice(QWidget):
+    """输入框下方的行内错误与恢复引导条（遵循 ui-ux-pro-max Inline Validation & Error Recovery）。"""
+
+    retryRequested = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(4, 0, 4, 0)
+        lay.setSpacing(8)
+        self.icon_lbl = QLabel()
+        self.icon_lbl.setFixedSize(16, 16)
+        lay.addWidget(self.icon_lbl)
+        self.msg_lbl = QLabel()
+        self.msg_lbl.setObjectName("err")
+        self.msg_lbl.setWordWrap(True)
+        lay.addWidget(self.msg_lbl, 1)
+        self.btn_retry = Button("重试", "secondary", "retry", height=26)
+        self.btn_retry.clicked.connect(self.retryRequested.emit)
+        lay.addWidget(self.btn_retry)
+        self.btn_dismiss = IconButton("close", "关闭提示", size=24)
+        self.btn_dismiss.clicked.connect(self.clear_error)
+        lay.addWidget(self.btn_dismiss)
+        self.hide()
+
+    def show_error(self, msg, can_retry=False):
+        self.icon_lbl.setPixmap(make_icon("warning", t_color("red"), 16))
+        self.msg_lbl.setText(str(msg or "解析失败"))
+        self.btn_retry.setVisible(bool(can_retry))
+        self.show()
+
+    def clear_error(self):
+        if self.isVisible():
+            self.hide()
 
 
 # ---------------------------------------------------------------- 队列模型
@@ -371,7 +457,6 @@ class QueueModel(QAbstractListModel):
         if role == Qt.DisplayRole:
             return job["title"]
         if role == Qt.ToolTipRole:
-            # break-ui 规范：任何可能被截断的标题、路径或报错都在 Tooltip 中完整呈现
             lines = [job.get("title") or ""]
             if job.get("error"):
                 lines.append("原因：" + job["error"])
@@ -383,11 +468,16 @@ class QueueModel(QAbstractListModel):
     def _reindex(self):
         self._row = {j["id"]: i for i, j in enumerate(self.jobs)}
 
+    def set_all(self, jobs):
+        self.beginResetModel()
+        self.jobs = list(jobs)
+        self._reindex()
+        self.endResetModel()
+
     def add(self, jobs):
         if not jobs:
             return
         now = time.monotonic()
-        # Choreograph 规范：前 5 项做 35ms 微错峰入场，总延迟控制在 175ms 内，绝不阻塞长列表
         for idx, j in enumerate(jobs):
             j["enter_t"] = now + min(idx, 5) * 0.035
         n = len(self.jobs)
@@ -435,6 +525,7 @@ class QueueDelegate(QStyledItemDelegate):
         self.fm_title = QFontMetrics(self.f_title)
         self.fm_meta = QFontMetrics(self.f_meta)
         self.hover_row = -1
+        self.focus_row = -1
         self.hover_action = False
         self.press_action = False
 
@@ -509,6 +600,7 @@ class QueueDelegate(QStyledItemDelegate):
             return
         p.save()
         p.setRenderHint(QPainter.Antialiasing)
+        t = theme()
 
         now = time.monotonic()
         enter_t = job.get("enter_t")
@@ -526,22 +618,26 @@ class QueueDelegate(QStyledItemDelegate):
 
         r = QRectF(option.rect).adjusted(8, 3, -8, -3)
         st = job["state"]
-        fg, soft = STATE_COLORS.get(st, STATE_COLORS["wait"])
-        is_hover = (index.row() == self.hover_row)
+        fg, soft = state_colors(st)
+        row = index.row()
+        is_hover = (row == self.hover_row)
+        is_focus = (row == self.focus_row and self.parent() and self.parent().hasFocus())
 
-        if is_hover:
+        if is_hover or is_focus:
             p.setPen(Qt.NoPen)
-            p.setBrush(QColor("#F6F7F8"))
+            p.setBrush(QColor(t["row_hover"]))
             p.drawRoundedRect(r, 10, 10)
+        if is_focus:
+            draw_focus_ring(p, r, 10)
 
-        # 左侧状态圆：运行中是环形进度，合并中是动态旋转环，完成打勾（带入场弹性），失败叉号
+        # 左侧状态圆
         c = QRectF(r.left() + 12, r.center().y() - 16, 32, 32)
         pct = job.get("shown", 0.0)
         if st in ("run", "merge"):
-            p.setPen(QPen(QColor(TRACK), 3))
+            p.setPen(QPen(QColor(t["track"]), 3))
             p.setBrush(Qt.NoBrush)
             p.drawEllipse(c.adjusted(2, 2, -2, -2))
-            pen = QPen(QColor(ORANGE if st == "merge" else BLUE), 3)
+            pen = QPen(QColor(t["orange"] if st == "merge" else t["blue"]), 3)
             pen.setCapStyle(Qt.RoundCap)
             p.setPen(pen)
             if st == "merge":
@@ -550,7 +646,7 @@ class QueueDelegate(QStyledItemDelegate):
             else:
                 span = max(4.0, pct * 3.6)
                 p.drawArc(c.adjusted(2, 2, -2, -2), 90 * 16, int(-span * 16))
-            p.setPen(QColor(INK_2))
+            p.setPen(QColor(t["ink_2"]))
             p.setFont(self.f_num)
             p.drawText(c, Qt.AlignCenter, "%d" % int(pct) if st == "run" else "···")
         else:
@@ -573,20 +669,20 @@ class QueueDelegate(QStyledItemDelegate):
                 p.drawPixmap(int(c.center().x() - 8), int(c.center().y() - 8),
                              make_icon(icon, fg, 16))
             else:
-                p.setPen(QColor(INK_3))
+                p.setPen(QColor(t["ink_3"]))
                 p.setFont(self.f_num)
-                p.drawText(c, Qt.AlignCenter, "%d" % (index.row() + 1))
+                p.drawText(c, Qt.AlignCenter, "%d" % (row + 1))
             p.restore()
 
         # 右侧状态或悬停快捷操作胶囊
-        spec = self.action_spec(job) if is_hover else None
+        spec = self.action_spec(job) if (is_hover or is_focus) else None
         right_w = 96
         x = c.right() + 14
-        tw = r.right() - x - right_w - 14
+        tw = max(40.0, r.right() - x - right_w - 14)
         top = r.center().y() - 19
 
         p.setFont(self.f_title)
-        p.setPen(QColor(INK if st != "cancel" else INK_3))
+        p.setPen(QColor(t["ink"] if st != "cancel" else t["ink_3"]))
         p.drawText(QRectF(x, top, tw, 20), Qt.AlignLeft | Qt.AlignVCenter,
                    self.fm_title.elidedText(job["title"], Qt.ElideRight, int(tw)))
 
@@ -597,12 +693,12 @@ class QueueDelegate(QStyledItemDelegate):
                 p.translate(act_r.center())
                 p.scale(0.95, 0.95)
                 p.translate(-act_r.center())
-            bg_c = QColor("#E4E6E9") if (self.hover_action and self.press_action) else (
-                QColor("#EAECEF") if self.hover_action else QColor("#FFFFFF"))
+            bg_c = QColor(t["field_press"]) if (self.hover_action and self.press_action) else (
+                QColor(t["field_hover"]) if self.hover_action else QColor(t["card"]))
             p.setBrush(bg_c)
-            p.setPen(QPen(QColor(LINE), 1))
+            p.setPen(QPen(QColor(t["line"]), 1))
             p.drawRoundedRect(act_r, 8, 8)
-            ic_color = RED if spec[0] == "cancel" else (ACCENT if spec[0] == "retry" else INK)
+            ic_color = t["red"] if spec[0] == "cancel" else (t["accent"] if spec[0] == "retry" else t["ink"])
             p.drawPixmap(QPointF(act_r.left() + 10, act_r.center().y() - 6.5),
                          make_icon(spec[1], ic_color, 13))
             p.setFont(self.f_action)
@@ -612,9 +708,8 @@ class QueueDelegate(QStyledItemDelegate):
             p.restore()
         else:
             status = self.status_text(job)
-            # 网速含数字时采用 tabular_font，防止数字变化造成右对齐抖动
             p.setFont(self.f_status_tab if (st == "run" and job.get("speed")) else self.f_meta)
-            p.setPen(QColor(fg if st != "wait" else INK_3))
+            p.setPen(QColor(fg if st != "wait" else t["ink_3"]))
             p.drawText(QRectF(r.right() - right_w - 14, top, right_w, 20),
                        Qt.AlignRight | Qt.AlignVCenter, status)
 
@@ -622,24 +717,23 @@ class QueueDelegate(QStyledItemDelegate):
         meta_right_pad = (self.ACTION_W + 24) if spec is not None else 14
         meta_w = max(40.0, r.right() - x - meta_right_pad)
         if st in ("run", "merge"):
-            # 细进度条 + 下面一行明细（运行期数字采用等宽字体防抖）
             bar = QRectF(x, top + 26, meta_w, 4)
             p.setPen(Qt.NoPen)
-            p.setBrush(QColor(TRACK))
+            p.setBrush(QColor(t["track"]))
             p.drawRoundedRect(bar, 2, 2)
             w = bar.width() * (1.0 if st == "merge" else pct / 100.0)
             if w > 1:
-                p.setBrush(QColor(ORANGE if st == "merge" else BLUE))
+                p.setBrush(QColor(t["orange"] if st == "merge" else t["blue"]))
                 p.drawRoundedRect(QRectF(bar.left(), bar.top(), w, bar.height()), 2, 2)
             p.setFont(self.f_meta_tab if st == "run" else self.f_meta)
-            p.setPen(QColor(INK_3))
+            p.setPen(QColor(t["ink_3"]))
             fm_m = QFontMetrics(p.font())
             p.drawText(QRectF(x, top + 33, meta_w, 16),
                        Qt.AlignLeft | Qt.AlignVCenter,
                        fm_m.elidedText(meta, Qt.ElideRight, int(meta_w)))
         else:
             p.setFont(self.f_meta)
-            p.setPen(QColor(RED if st == "fail" else INK_3))
+            p.setPen(QColor(t["red"] if st == "fail" else t["ink_3"]))
             p.drawText(QRectF(x, top + 22, meta_w, 18),
                        Qt.AlignLeft | Qt.AlignVCenter,
                        self.fm_meta.elidedText(meta, Qt.ElideRight, int(meta_w)))
@@ -648,16 +742,74 @@ class QueueDelegate(QStyledItemDelegate):
 
 class QueueView(QListView):
     actionTriggered = pyqtSignal(str, dict)     # action_kind, job
+    deleteRequested = pyqtSignal(dict)          # job
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.TabFocus)
         self.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.verticalScrollBar().setSingleStep(24)
         self.setSelectionMode(QAbstractItemView.NoSelection)
         self.setUniformItemSizes(True)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._empty_filter_text = ""
+
+    def setEmptyFilterText(self, text):
+        if self._empty_filter_text != text:
+            self._empty_filter_text = text
+            self.viewport().update()
+
+    def _visible_rows(self):
+        m = self.model()
+        if not m:
+            return []
+        return [i for i in range(m.rowCount()) if not self.isRowHidden(i)]
+
+    def focusInEvent(self, e):
+        super().focusInEvent(e)
+        d = self.itemDelegate()
+        vis = self._visible_rows()
+        if vis and d.focus_row not in vis:
+            d.focus_row = vis[0]
+        if d.focus_row >= 0:
+            self.update(self.model().index(d.focus_row))
+
+    def focusOutEvent(self, e):
+        super().focusOutEvent(e)
+        d = self.itemDelegate()
+        if d.focus_row >= 0:
+            self.update(self.model().index(d.focus_row))
+
+    def keyPressEvent(self, e):
+        vis = self._visible_rows()
+        d = self.itemDelegate()
+        key = e.key()
+        if key in (Qt.Key_Down, Qt.Key_Up) and vis:
+            cur = d.focus_row if d.focus_row in vis else vis[0]
+            idx = vis.index(cur)
+            nxt = vis[min(len(vis) - 1, idx + 1)] if key == Qt.Key_Down else vis[max(0, idx - 1)]
+            old = d.focus_row
+            d.focus_row = nxt
+            for r in {old, nxt}:
+                if r >= 0:
+                    self.update(self.model().index(r))
+            self.scrollTo(self.model().index(nxt))
+            e.accept()
+            return
+        if key in (Qt.Key_Return, Qt.Key_Enter) and d.focus_row in vis:
+            ix = self.model().index(d.focus_row)
+            self.doubleClicked.emit(ix)
+            e.accept()
+            return
+        if key in (Qt.Key_Delete, Qt.Key_Backspace) and d.focus_row in vis:
+            job = self.model().index(d.focus_row).data(QueueModel.JobRole)
+            if job:
+                self.deleteRequested.emit(job)
+            e.accept()
+            return
+        super().keyPressEvent(e)
 
     def _hit_action(self, pos):
         ix = self.indexAt(pos)
@@ -690,8 +842,13 @@ class QueueView(QListView):
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
             ix, _job, on_act = self._hit_action(e.pos())
+            d = self.itemDelegate()
+            if ix.isValid():
+                old_f = d.focus_row
+                d.focus_row = ix.row()
+                if old_f >= 0:
+                    self.update(self.model().index(old_f))
             if on_act:
-                d = self.itemDelegate()
                 d.press_action = True
                 self.update(ix)
                 return
@@ -727,12 +884,20 @@ class QueueView(QListView):
     def paintEvent(self, e):
         super().paintEvent(e)
         p = QPainter(self.viewport())
-        draw_scroll_edge_fade(p, self.viewport().rect(), self.verticalScrollBar(), CARD, 16)
+        p.setRenderHint(QPainter.Antialiasing)
+        if self._empty_filter_text:
+            vr = self.viewport().rect()
+            cx, cy = vr.width() / 2.0, vr.height() / 2.0 - 8
+            p.setPen(QColor(t_color("ink_2")))
+            p.setFont(ui_font(13, QFont.Medium))
+            p.drawText(QRectF(0, cy - 10, vr.width(), 22), Qt.AlignCenter, self._empty_filter_text)
+        else:
+            draw_scroll_edge_fade(p, self.viewport().rect(), self.verticalScrollBar(), t_color("card"), 28)
         p.end()
 
 
 class EmptyState(QWidget):
-    """队列为空时的提示（整块自绘，支持拖放悬停时的缩放与高亮反馈）。"""
+    """队列为空时的提示（整块自绘，支持深浅色主题与拖放悬停反馈）。"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -760,6 +925,7 @@ class EmptyState(QWidget):
     def paintEvent(self, e):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
+        t = theme()
         cx, cy = self.width() / 2.0, self.height() / 2.0 - 24
 
         p.save()
@@ -769,17 +935,18 @@ class EmptyState(QWidget):
             p.scale(sc, sc)
             p.translate(-cx, -cy)
         circle = QRectF(cx - 30, cy - 30, 60, 60)
-        p.setPen(QPen(QColor(ACCENT), 1.5 * self._drag) if self._drag > 0.05 else Qt.NoPen)
-        p.setBrush(mix("#FFF0F4", "#FFE0E9", self._drag))
+        p.setPen(QPen(QColor(t["accent"]), 1.5 * self._drag) if self._drag > 0.05 else Qt.NoPen)
+        hi_soft = "#4D2434" if is_dark() else "#FFE0E9"
+        p.setBrush(mix(t["accent_soft"], hi_soft, self._drag))
         p.drawEllipse(circle)
-        p.drawPixmap(int(cx - 13), int(cy - 13), make_icon("download", ACCENT, 26))
+        p.drawPixmap(int(cx - 13), int(cy - 13), make_icon("download", t["accent"], 26))
         p.restore()
 
-        p.setPen(QColor(ACCENT if self._drag > 0.5 else INK))
+        p.setPen(QColor(t["accent"] if self._drag > 0.5 else t["ink"]))
         p.setFont(ui_font(15, QFont.DemiBold))
         title = "松开鼠标，立即解析链接" if self._drag > 0.5 else "粘贴链接，开始下载"
         p.drawText(QRectF(0, cy + 44, self.width(), 24), Qt.AlignHCenter | Qt.AlignVCenter, title)
-        p.setPen(QColor(INK_3))
+        p.setPen(QColor(t["ink_3"]))
         p.setFont(ui_font(12))
         p.drawText(QRectF(0, cy + 72, self.width(), 20), Qt.AlignHCenter | Qt.AlignVCenter,
                    "支持视频、分P、番剧、合集、收藏夹和 b23.tv 短链")
@@ -789,21 +956,14 @@ class EmptyState(QWidget):
 
 
 class Toast(QWidget):
-    """底部居中的 Sonner 风格轻提示（遵循 Emil Kowalski 的 Sonner 设计原则）：
-
-    1. 空间一致性：从底部 translateY(+14px) + scale(0.96) + opacity(0) 入场，
-       退场沿原路径回到 translateY(+10px)，入场 240ms、退场 180ms（非对称时序）。
-    2. 可打断性（Interruptible）：动画途中再次触发时，从当前实时位置与宽度平滑重定向。
-    3. 边缘体验：鼠标悬停在 Toast 上时自动暂停倒计时，移开后恢复；点击即可立即关闭。
-    4. 语义图标：根据消息内容自动匹配成功（绿勾）、警告（橙叹号）或提示（粉标）图标。
-    """
+    """底部居中的 Sonner 风格轻提示。"""
 
     def __init__(self, parent):
         super().__init__(parent)
         self.setCursor(Qt.PointingHandCursor)
         self._text = ""
         self._kind = "info"
-        self._progress = 0.0      # 0.0 = 隐藏, 1.0 = 完全展现
+        self._progress = 0.0
         self._closing = False
         self._remain_ms = 2200
         self._font = ui_font(13, QFont.Medium)
@@ -846,7 +1006,6 @@ class Toast(QWidget):
         self._anim.start()
 
     def enterEvent(self, e):
-        # Sonner 原则：鼠标悬停时暂停自动消失计时
         if self._hide_timer.isActive():
             self._remain_ms = max(800, self._hide_timer.remainingTime())
             self._hide_timer.stop()
@@ -903,24 +1062,22 @@ class Toast(QWidget):
             p.scale(sc, sc)
             p.translate(-r.center())
 
-        # 柔和底部投影
         p.setPen(Qt.NoPen)
         for dy, alpha in ((3.0, 22), (1.5, 38)):
-            p.setBrush(QColor(15, 20, 30, alpha))
+            p.setBrush(QColor(0, 0, 0, alpha))
             p.drawRoundedRect(r.adjusted(-1, dy, 1, dy + 1), 12, 12)
 
-        # 深色磨砂质感底 + 顶部微亮高光边
-        p.setBrush(QColor(24, 25, 28, 240))
-        p.setPen(QPen(QColor(255, 255, 255, 30), 1))
+        p.setBrush(QColor(24, 25, 28, 242))
+        p.setPen(QPen(QColor(255, 255, 255, 34), 1))
         p.drawRoundedRect(r, 11, 11)
 
         ic_map = {
-            "ok": ("check", GREEN),
-            "warn": ("warning", ORANGE),
-            "paste": ("paste", ACCENT),
-            "info": ("info", ACCENT),
+            "ok": ("check", "#36C982"),
+            "warn": ("warning", "#FFAD42"),
+            "paste": ("paste", "#FB7299"),
+            "info": ("info", "#FB7299"),
         }
-        ic_name, ic_col = ic_map.get(self._kind, ("info", ACCENT))
+        ic_name, ic_col = ic_map.get(self._kind, ("info", "#FB7299"))
         p.drawPixmap(QPointF(r.left() + 14, r.center().y() - 8), make_icon(ic_name, ic_col, 16))
 
         p.setFont(self._font)
@@ -934,8 +1091,38 @@ class Toast(QWidget):
         p.end()
 
 
+# ---------------------------------------------------------------- Break-UI 压力测试浮动切换栏
+class BreakUiBar(QWidget):
+    """Emil Kowalski break-ui 技能：在界面底部提供 Demo / 极端数据 / 空状态 / 单条 / 1000行 实时切换器。"""
+
+    modeChanged = pyqtSignal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(10, 6, 10, 6)
+        lay.setSpacing(8)
+        lbl = QLabel("Break UI 压测")
+        lbl.setFont(ui_font(11, QFont.DemiBold))
+        lay.addWidget(lbl)
+        self.seg = Segmented(["还原", "常规示例", "极端数据", "空状态", "单条", "1000行"], compact=True)
+        self.seg.changed.connect(self.modeChanged.emit)
+        lay.addWidget(self.seg)
+        self.adjustSize()
+        self.hide()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        p.setBrush(QColor(t_color("card")))
+        p.setPen(QPen(QColor(t_color("accent")), 1.5))
+        p.drawRoundedRect(r, 11, 11)
+        p.end()
+
+
 class PathButton(Button):
-    """显示保存目录的按钮：路径太长时中间省略（break-ui：文件名与路径保留首尾特征）。"""
+    """显示保存目录的按钮：路径太长时中间省略。"""
 
     MAX_W = 340
 
@@ -1010,11 +1197,11 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("BiliFetch")
         self.setWindowIcon(load_app_icon())
         self.setAcceptDrops(True)
-        self.dl_thread = None          # 当前的下载队列线程
-        self._old_threads = []         # 已经不接活、但还没退出的线程（不能提前析构）
-        self._pending = []             # 旧线程收尾期间加进来的任务
+        self.dl_thread = None
+        self._old_threads = []
+        self._pending = []
         self._next_id = 1
-        self._samples = {}             # 任务 id -> (时刻, 字节)，算速度用
+        self._samples = {}
         self._preview_thread = None
         self._login_thread = None
         self._last_clip = ""
@@ -1022,6 +1209,8 @@ class MainWindow(QMainWindow):
         self._cookie = ""
         self._proxy = ""
         self._nickname = ""
+        self._theme_mode = "light"
+        self._saved_real_jobs = None
         self._build_ui()
         self._load_settings()
         QTimer.singleShot(80, self._check_login)
@@ -1030,13 +1219,13 @@ class MainWindow(QMainWindow):
     def _build_ui(self):
         central = QWidget()
         root = QVBoxLayout(central)
-        root.setContentsMargins(22, 16, 22, 18)
-        root.setSpacing(10)
+        root.setContentsMargins(24, 16, 24, 18)
+        root.setSpacing(12)
 
-        # ---- 顶栏 ----
+        # ---- 顶栏（8px 间距网格，34x34 热区）----
         head = QHBoxLayout()
         head.setContentsMargins(6, 0, 6, 0)
-        head.setSpacing(10)
+        head.setSpacing(8)
         head.addWidget(LogoTile(34))
         t = QLabel("BiliFetch")
         t.setObjectName("h1")
@@ -1045,6 +1234,9 @@ class MainWindow(QMainWindow):
         self.account = AccountChip()
         self.account.clicked.connect(self._on_account)
         head.addWidget(self.account)
+        self.btn_theme = IconButton("moon", "切换深色 / 浅色外观（⌘T）", size=34)
+        self.btn_theme.clicked.connect(self.toggle_theme)
+        head.addWidget(self.btn_theme)
         self.btn_settings = IconButton("gear", "设置（代理 / Cookie）", size=34)
         self.btn_settings.clicked.connect(self.on_settings)
         head.addWidget(self.btn_settings)
@@ -1053,7 +1245,7 @@ class MainWindow(QMainWindow):
         # ---- 输入卡 ----
         self.input_card = Card(padding=(18, 18, 18, 16))
         card = self.input_card
-        card.layout.setSpacing(14)
+        card.layout.setSpacing(12)
         row = QHBoxLayout()
         row.setSpacing(10)
         self.url_edit = QLineEdit()
@@ -1061,6 +1253,7 @@ class MainWindow(QMainWindow):
         self.url_edit.setPlaceholderText("粘贴 B 站链接或 BV 号，回车解析")
         self.url_edit.setClearButtonEnabled(True)
         self.url_edit.returnPressed.connect(self.on_browse)
+        self.url_edit.textChanged.connect(self._on_url_text_changed)
         paste = QAction(QIcon(make_icon("paste", INK_3, 16)), "粘贴", self.url_edit)
         paste.setToolTip("从剪贴板粘贴")
         paste.triggered.connect(self._paste_clipboard)
@@ -1073,6 +1266,11 @@ class MainWindow(QMainWindow):
         row.addWidget(self.btn_start)
         card.layout.addLayout(row)
 
+        # 行内错误校验提示条（默认隐藏，出错时就近出现在输入框正下方）
+        self.inline_notice = InlineNotice()
+        self.inline_notice.retryRequested.connect(self.on_browse)
+        card.layout.addWidget(self.inline_notice)
+
         opt = QHBoxLayout()
         opt.setSpacing(8)
         lbl = QLabel("保存到")
@@ -1084,6 +1282,9 @@ class MainWindow(QMainWindow):
         self.btn_open = IconButton("open", "打开下载文件夹", size=36)
         self.btn_open.clicked.connect(self.on_open_dir)
         opt.addWidget(self.btn_open)
+        opt.addSpacing(4)
+        self.link_badge = LinkBadge()
+        opt.addWidget(self.link_badge)
         opt.addStretch(1)
         lbl2 = QLabel("画质")
         lbl2.setObjectName("sub")
@@ -1103,11 +1304,14 @@ class MainWindow(QMainWindow):
         qcard.layout.setSpacing(8)
         qhead = QHBoxLayout()
         qhead.setContentsMargins(4, 0, 0, 0)
-        qhead.setSpacing(6)
+        qhead.setSpacing(8)
         self.seg = Segmented(["下载", "日志"])
         self.seg.changed.connect(self._switch_tab)
         qhead.addWidget(self.seg)
-        qhead.addSpacing(8)
+        self.filter_seg = Segmented(["全部", "进行中", "已完成", "失败"], compact=True)
+        self.filter_seg.changed.connect(lambda _i: self._apply_queue_filter())
+        self.filter_seg.hide()
+        qhead.addWidget(self.filter_seg)
         self.summary = QLabel("")
         self.summary.setObjectName("muted")
         self.summary.setFont(tabular_font(12))
@@ -1136,6 +1340,7 @@ class MainWindow(QMainWindow):
         self.list.setModel(self.model)
         self.list.doubleClicked.connect(self._on_double_click)
         self.list.actionTriggered.connect(self._on_row_action)
+        self.list.deleteRequested.connect(self._on_key_delete_job)
         self.list.customContextMenuRequested.connect(self._on_context_menu)
         page_q.addWidget(self.list)
         self.page_q = page_q
@@ -1153,32 +1358,37 @@ class MainWindow(QMainWindow):
         root.addWidget(qcard, 1)
         self.setCentralWidget(central)
         self.toast = Toast(central)
+        self.break_bar = BreakUiBar(central)
+        self.break_bar.modeChanged.connect(self._apply_break_ui_mode)
 
         self.setMinimumSize(760, 600)
         self.resize(920, 720)
 
-        # 共享的进度动画定时器：只在有行在动时运行
         self._anim_timer = QTimer(self)
         self._anim_timer.setTimerType(Qt.PreciseTimer)
         self._anim_timer.setInterval(16)
         self._anim_timer.timeout.connect(self._tick_progress)
-        # 速度统计：0.5 秒一次
         self._speed_timer = QTimer(self)
         self._speed_timer.setInterval(500)
         self._speed_timer.timeout.connect(self._tick_speed)
 
-        # 菜单（快捷键全部直接响应，遵循 Emil Kowalski "Never animate keyboard-initiated actions"）
+        # 菜单（快捷键全部 0ms 瞬时响应）
         m = self.menuBar().addMenu("文件")
         a = m.addAction("解析剪贴板里的链接", self._paste_and_browse)
         a.setShortcut(QKeySequence("Ctrl+Shift+V"))
         a = m.addAction("打开下载文件夹", self.on_open_dir)
         a.setShortcut(QKeySequence("Ctrl+O"))
+        a = m.addAction("切换深色 / 浅色外观", self.toggle_theme)
+        a.setShortcut(QKeySequence("Ctrl+T"))
         a = m.addAction("设置…", self.on_settings)
         a.setShortcut(QKeySequence("Ctrl+,"))
         a.setMenuRole(QAction.PreferencesRole)
         m.addSeparator()
         m.addAction("退出", self.close).setMenuRole(QAction.QuitRole)
         m2 = self.menuBar().addMenu("帮助")
+        a_break = m2.addAction("界面压力测试（Break UI）", self.toggle_break_ui_bar)
+        a_break.setShortcut(QKeySequence("Ctrl+Shift+B"))
+        m2.addSeparator()
         m2.addAction("关于 BiliFetch", self.on_about).setMenuRole(QAction.AboutRole)
         focus = QAction(self)
         focus.setShortcut(QKeySequence("Ctrl+L"))
@@ -1192,6 +1402,61 @@ class MainWindow(QMainWindow):
         super().resizeEvent(e)
         if self.toast.isVisible():
             self.toast._reposition()
+        if self.break_bar.isVisible():
+            self._reposition_break_bar()
+
+    def _reposition_break_bar(self):
+        par = self.centralWidget()
+        if par:
+            self.break_bar.adjustSize()
+            self.break_bar.move((par.width() - self.break_bar.width()) // 2,
+                                par.height() - self.break_bar.height() - 14)
+            self.break_bar.raise_()
+
+    # ---------------- 主题切换 ----------------
+    def toggle_theme(self):
+        nxt = "light" if is_dark() else "dark"
+        self.apply_theme(nxt, save=True)
+        self.toast.show_message("已切换为%s外观" % ("深色" if nxt == "dark" else "浅色"), kind="info")
+
+    def apply_theme(self, mode, save=False):
+        resolved = set_theme(mode)
+        self._theme_mode = resolved
+        self.btn_theme.setIconKind("sun" if resolved == "dark" else "moon")
+        self.btn_theme.setToolTip("切换为%s外观（⌘T）" % ("浅色" if resolved == "dark" else "深色"))
+        if save:
+            self._save_settings()
+
+    # ---------------- 链接识别与行内校验 ----------------
+    def _on_url_text_changed(self, text):
+        if self.url_edit.property("invalid") == "true":
+            self.url_edit.setProperty("invalid", "false")
+            self.url_edit.style().unpolish(self.url_edit)
+            self.url_edit.style().polish(self.url_edit)
+        self.inline_notice.clear_error()
+        self.link_badge.setKind(classify_link(text))
+
+    def _set_input_error(self, msg, can_retry=False):
+        self.url_edit.setProperty("invalid", "true")
+        self.url_edit.style().unpolish(self.url_edit)
+        self.url_edit.style().polish(self.url_edit)
+        self.inline_notice.show_error(msg, can_retry=can_retry)
+        if not reduced_motion():
+            # 水平微震提示（±5px, 180ms）
+            pos0 = self.url_edit.pos()
+            anim = QVariantAnimation(self.url_edit)
+            anim.setDuration(180)
+            anim.setStartValue(0.0)
+            anim.setEndValue(1.0)
+            anim.valueChanged.connect(
+                lambda v: self.url_edit.move(
+                    pos0.x() + int(round(5.0 * (1.0 - float(v)) * (-1 if int(float(v) * 6) % 2 else 1))),
+                    pos0.y()
+                )
+            )
+            anim.finished.connect(lambda: self.url_edit.move(pos0))
+            self._shake_anim = anim
+            anim.start()
 
     def _switch_tab(self, i):
         self.stack.setCurrentIndex(i)
@@ -1199,6 +1464,7 @@ class MainWindow(QMainWindow):
         self.btn_clear.setVisible(q)
         self.btn_stop.setVisible(q)
         self.summary.setVisible(q)
+        self.filter_seg.setVisible(q and len(self.model.jobs) > 0)
         self.btn_copy.setVisible(not q)
         self.btn_logclear.setVisible(not q)
         if not q:
@@ -1299,10 +1565,9 @@ class MainWindow(QMainWindow):
         self._set_login_state(dlg.nickname or "已登录")
         self.append_log("登录成功：%s（高清画质已解锁）" % (dlg.nickname or ""))
         self.toast.show_message("登录成功，已解锁高清画质", kind="ok")
-        self._save_settings()      # 立刻存盘，别等退出时才写
+        self._save_settings()
 
     def _check_login(self):
-        """启动时在后台确认存的 Cookie 还能不能用（先按上次的昵称显示，不让用户干等）。"""
         if not self._cookie:
             self._set_login_state(None)
             return
@@ -1312,7 +1577,6 @@ class MainWindow(QMainWindow):
         self._login_thread.start()
 
     def _on_login_checked(self, state, name):
-        # 网络错误（error）不能当成登录失效 —— 否则用户每次开软件都要重新扫码
         if state == "ok":
             self._set_login_state(name)
             self._save_settings()
@@ -1354,7 +1618,6 @@ class MainWindow(QMainWindow):
 
     def _ensure_out_dir(self):
         default_dir = os.path.join(os.path.expanduser("~"), "Downloads", "BiliFetch")
-        # 必须是绝对路径：从 Dock 启动时 CWD 是 /，相对路径会存到奇怪的地方
         out_dir = os.path.abspath(os.path.expanduser(self.btn_pick.path() or default_dir))
         try:
             os.makedirs(out_dir, exist_ok=True)
@@ -1372,7 +1635,6 @@ class MainWindow(QMainWindow):
 
     def on_copy_log(self):
         QApplication.clipboard().setText(self.log_view.toPlainText())
-        # Emil Kowalski 状态指示：复制按钮瞬时切换为对勾与「已复制」
         self.btn_copy.setIconKind("check")
         self.btn_copy.setText("已复制")
         QTimer.singleShot(1400, lambda: (self.btn_copy.setIconKind("copy"),
@@ -1394,10 +1656,11 @@ class MainWindow(QMainWindow):
         url = self.url_edit.text().strip()
         if not url:
             self.url_edit.setFocus()
-            self.toast.show_message("先粘贴一个 B 站链接", kind="info")
+            self._set_input_error("请先粘贴一个 B 站视频 / 番剧 / 合集链接或 BV 号", can_retry=False)
             return
         if self._preview_thread is not None and self._preview_thread.isRunning():
             return
+        self.inline_notice.clear_error()
         self.btn_start.setLoading(True, "解析中")
         self._preview_url = url
         t = PreviewThread(url, self._cookie, self._proxy, self)
@@ -1413,12 +1676,14 @@ class MainWindow(QMainWindow):
     def _on_preview_failed(self, msg):
         self._reset_browse_button()
         self.append_log("解析失败：%s" % msg)
-        QMessageBox.warning(self, "解析失败", msg)
+        self._set_input_error("解析失败：%s" % (msg.splitlines()[0] if msg else "无法识别该链接"),
+                              can_retry=True)
+        self.url_edit.setFocus()
 
     def _on_preview(self, info):
         self._reset_browse_button()
         if not info or not info.get("items"):
-            QMessageBox.information(self, "提示", "这个链接里没有可下载的内容")
+            self._set_input_error("这个链接里没有找到可下载的视频内容", can_retry=False)
             return
         dlg = CollectionDialog(info, self._preview_url, self)
         if dlg.exec_() == QDialog.Accepted:
@@ -1427,7 +1692,33 @@ class MainWindow(QMainWindow):
                 self._start_download(self._preview_url, items=items, audio_only=dlg.audio_only)
                 self.url_edit.clear()
 
-    # ---------------- 下载队列 ----------------
+    # ---------------- 下载队列与筛选 ----------------
+    def _apply_queue_filter(self):
+        f_idx = self.filter_seg.index()
+        # 0 = 全部, 1 = 进行中, 2 = 已完成, 3 = 失败/取消
+        v = self.list
+        v.setUpdatesEnabled(False)
+        vis_count = 0
+        try:
+            for i, job in enumerate(self.model.jobs):
+                st = job["state"]
+                if f_idx == 1:
+                    hide = st not in ("wait", "run", "merge")
+                elif f_idx == 2:
+                    hide = st != "done"
+                elif f_idx == 3:
+                    hide = st not in ("fail", "cancel")
+                else:
+                    hide = False
+                if v.isRowHidden(i) != hide:
+                    v.setRowHidden(i, hide)
+                if not hide:
+                    vis_count += 1
+        finally:
+            v.setUpdatesEnabled(True)
+        labels = ["", "当前没有正在进行的下载任务", "还没有已完成的下载任务", "没有失败或取消的任务"]
+        v.setEmptyFilterText(labels[f_idx] if (self.model.jobs and vis_count == 0) else "")
+
     def _start_download(self, url, items=None, audio_only=False):
         """把要下载的内容加入队列。items 为空时按链接直接解析下载（自检用）。"""
         out_dir = self._ensure_out_dir()
@@ -1447,6 +1738,7 @@ class MainWindow(QMainWindow):
             self._next_id += 1
             jobs.append(job)
         self.model.add(jobs)
+        self._apply_queue_filter()
         self.page_q.setCurrentIndex(1)
         if self.seg.index() != 0:
             self.seg.setIndex(0)
@@ -1462,7 +1754,6 @@ class MainWindow(QMainWindow):
         if t is not None and t.add(jobs):
             return
         if t is not None and t.isRunning():
-            # 旧线程已经不接活了（正在收尾）：先记下，等它退出马上接着下
             self._pending.extend(jobs)
             return
         self._spawn(jobs)
@@ -1508,9 +1799,10 @@ class MainWindow(QMainWindow):
                        done_b=0, total=0)
             self._samples.pop(jid, None)
             self.model.touch(jid)
+            self._apply_queue_filter()
             self._refresh_summary()
             r = self.model.row_of(jid)
-            if r is not None:
+            if r is not None and not self.list.isRowHidden(r):
                 self.list.scrollTo(self.model.index(r))
 
     def _on_job_title(self, jid, title):
@@ -1546,7 +1838,6 @@ class MainWindow(QMainWindow):
         frac = max(0.0, min(1.0, done / total))
         n = job.get("parts", 1)
         pct = (job.get("part", 0) + frac) / n * 100.0
-        # 视频流、音频流的总大小先后才知道，合起来的百分比可能往回跳一点：只进不退
         job["target"] = max(job.get("target", 0.0), pct)
         job["done_b"], job["total"] = done, total
         if job["state"] != "run":
@@ -1566,6 +1857,7 @@ class MainWindow(QMainWindow):
             job.update(state="done", path=path, size=size, shown=100.0, target=100.0,
                        speed=0, done_t=time.monotonic())
             self.model.touch(jid)
+            self._apply_queue_filter()
             if not self._anim_timer.isActive():
                 self._anim_timer.start()
         self.append_log("完成：%s" % path)
@@ -1578,6 +1870,7 @@ class MainWindow(QMainWindow):
             job.update(state="fail", error=msg.splitlines()[0][:200] if msg else "下载失败",
                        speed=0)
             self.model.touch(jid)
+            self._apply_queue_filter()
         self._refresh_summary()
         self._maybe_all_done()
 
@@ -1586,6 +1879,7 @@ class MainWindow(QMainWindow):
         if job:
             job.update(state="cancel", speed=0)
             self.model.touch(jid)
+            self._apply_queue_filter()
         self._refresh_summary()
 
     def _maybe_all_done(self):
@@ -1596,7 +1890,7 @@ class MainWindow(QMainWindow):
         bad = sum(1 for j in jobs if j["state"] == "fail")
         if ok and not bad:
             self.toast.show_message("全部下载完成", kind="ok")
-            QApplication.alert(self)      # 窗口在后台时让 Dock 图标跳一下
+            QApplication.alert(self)
         elif bad:
             self.toast.show_message("%d 个失败，悬停或右键可重试" % bad, 3000, kind="warn")
 
@@ -1606,7 +1900,6 @@ class MainWindow(QMainWindow):
         now = time.monotonic()
         for job in self.model.jobs:
             row_dirty = False
-            # 1. 新行入场错峰微动画
             if job.get("enter_t") is not None:
                 if now - job["enter_t"] < 0.24:
                     moving = True
@@ -1614,7 +1907,6 @@ class MainWindow(QMainWindow):
                 else:
                     job.pop("enter_t", None)
                     row_dirty = True
-            # 2. 完成态绿勾微弹入场
             if job.get("done_t") is not None:
                 if now - job["done_t"] < 0.24:
                     moving = True
@@ -1622,12 +1914,10 @@ class MainWindow(QMainWindow):
                 else:
                     job.pop("done_t", None)
                     row_dirty = True
-            # 3. 合并态动态旋转弧
             if job["state"] == "merge":
                 job["merge_angle"] = (job.get("merge_angle", 0.0) + 7.5) % 360.0
                 moving = True
                 row_dirty = True
-            # 4. 下载进度平滑插值
             elif job["state"] == "run":
                 tgt, cur = job.get("target", 0.0), job.get("shown", 0.0)
                 if abs(tgt - cur) >= 0.05:
@@ -1639,7 +1929,7 @@ class MainWindow(QMainWindow):
                     row_dirty = True
             if row_dirty:
                 r = self.model.row_of(job["id"])
-                if r is not None:
+                if r is not None and not self.list.isRowHidden(r):
                     self.list.update(self.model.index(r))
         if not moving:
             self._anim_timer.stop()
@@ -1665,9 +1955,11 @@ class MainWindow(QMainWindow):
 
     def _refresh_summary(self, speed=None):
         jobs = self.model.jobs
+        self.filter_seg.setVisible(self.seg.index() == 0 and len(jobs) > 0)
         if not jobs:
             self.summary.setText("")
             self.seg.setBadge(0, "")
+            self.setWindowTitle("BiliFetch")
             self.btn_stop.setEnabled(False)
             self.btn_clear.setEnabled(False)
             return
@@ -1682,10 +1974,12 @@ class MainWindow(QMainWindow):
             txt = "%d / %d" % (done, n)
             if speed:
                 txt += "  ·  " + human_speed(speed)
+            self.setWindowTitle("BiliFetch (%d/%d)" % (done, n))
         else:
             txt = "已完成 %d 个" % done
             if fail:
                 txt += "，失败 %d 个" % fail
+            self.setWindowTitle("BiliFetch")
         if self.summary.text() != txt:
             self.summary.setText(txt)
         self.btn_stop.setEnabled(bool(active))
@@ -1701,11 +1995,13 @@ class MainWindow(QMainWindow):
             self.dl_thread.cancel_all()
             if self.dl_thread not in self._old_threads:
                 self._old_threads.append(self.dl_thread)
+        self._apply_queue_filter()
         self.list.viewport().update()
         self._refresh_summary()
 
     def on_clear(self):
         self.model.remove_where(lambda j: j["state"] in ("done", "cancel"))
+        self._apply_queue_filter()
         if not self.model.jobs:
             self.page_q.setCurrentIndex(0)
         self._refresh_summary()
@@ -1717,6 +2013,12 @@ class MainWindow(QMainWindow):
             self._retry([job])
         elif kind == "cancel":
             self._cancel_job(job)
+
+    def _on_key_delete_job(self, job):
+        if job["state"] in ("wait", "run", "merge"):
+            self._cancel_job(job)
+        else:
+            self._remove_job(job)
 
     def _on_double_click(self, ix):
         job = ix.data(QueueModel.JobRole)
@@ -1757,6 +2059,7 @@ class MainWindow(QMainWindow):
         for job in jobs:
             job.update(state="wait", shown=0.0, target=0.0, error="", speed=0, part=0)
             self.model.touch(job["id"])
+        self._apply_queue_filter()
         self._submit(list(jobs))
         self._refresh_summary()
 
@@ -1767,14 +2070,82 @@ class MainWindow(QMainWindow):
             self._pending = [j for j in self._pending if j["id"] != job["id"]]
         if self.dl_thread is not None:
             self.dl_thread.cancel_job(job["id"])
+        self._apply_queue_filter()
         self._refresh_summary()
 
     def _remove_job(self, job):
         if self.dl_thread is not None:
             self.dl_thread.cancel_job(job["id"])
         self.model.remove_where(lambda j: j["id"] == job["id"])
+        self._apply_queue_filter()
         if not self.model.jobs:
             self.page_q.setCurrentIndex(0)
+        self._refresh_summary()
+
+    # ---------------- Break-UI 压力测试（Emil Kowalski break-ui 技能）----------------
+    def toggle_break_ui_bar(self):
+        if self.break_bar.isVisible():
+            self._apply_break_ui_mode(0)
+            self.break_bar.hide()
+        else:
+            if self._saved_real_jobs is None:
+                self._saved_real_jobs = list(self.model.jobs)
+            self.break_bar.show()
+            self._reposition_break_bar()
+            self.break_bar.seg.setIndex(2)    # 默认直接展示「极端数据」
+
+    def _apply_break_ui_mode(self, mode_idx):
+        # 0=还原, 1=常规示例, 2=极端数据, 3=空状态, 4=单条, 5=1000行
+        if self._saved_real_jobs is None:
+            self._saved_real_jobs = list(self.model.jobs)
+        if mode_idx == 0:
+            real = self._saved_real_jobs or []
+            self._saved_real_jobs = None
+            self.model.set_all(real)
+            self.page_q.setCurrentIndex(1 if real else 0)
+            self._apply_queue_filter()
+            self._refresh_summary()
+            return
+        if mode_idx == 1:
+            jobs = [
+                {"id": 9001, "title": "第01话 末世桃源", "state": "done", "shown": 100.0, "target": 100.0, "size": 536870912, "path": "/tmp/第01话 末世桃源.mp4", "parts": 1, "part": 0},
+                {"id": 9002, "title": "第02话 波澜初起", "state": "done", "shown": 100.0, "target": 100.0, "size": 536870912, "path": "/tmp/第02话 波澜初起.mp4", "parts": 1, "part": 0},
+                {"id": 9003, "title": "第03话 长夜（4K 修复版）", "state": "run", "shown": 63.0, "target": 63.0, "speed": 8808038, "done_b": 327155712, "total": 522190848, "parts": 3, "part": 1},
+                {"id": 9004, "title": "第04话 雷云", "state": "merge", "shown": 100.0, "target": 100.0, "merge_angle": 45.0, "parts": 1, "part": 0},
+                {"id": 9005, "title": "第05话 天光", "state": "wait", "shown": 0.0, "target": 0.0, "quality_label": "最高画质", "parts": 1, "part": 0},
+                {"id": 9006, "title": "第06话 余烬", "state": "fail", "shown": 0.0, "target": 0.0, "error": "HTTP 403: 没有权限（可能需要大会员）", "parts": 1, "part": 0},
+            ]
+        elif mode_idx == 2:
+            # break-ui 极端但真实的数据集（超长多语言标题、Emoji 前缀、无空格长 URL 错误、极端大文件与分P）
+            self._set_login_state("🦊 Aleksandra Wiśniewska-Kowalczyk · 超级无敌长昵称测试账号")
+            jobs = [
+                {"id": 9101, "title": "【4K HDR 120FPS 杜比视界】《灵笼 第二季 · 终章》全集高码率收藏版 — Supercalifragilisticexpialidocious_2026_Remastered_Edition_Final_v12", "state": "run", "shown": 98.4, "target": 98.4, "speed": 134217728, "done_b": 19864223744, "total": 20186346291, "parts": 128, "part": 126, "audio_only": True},
+                {"id": 9102, "title": "A", "state": "done", "shown": 100.0, "target": 100.0, "size": 999, "path": "/Volumes/ExternalDrive/Media/Archive/2026/Bilibili/极其深层的目录结构测试/子目录A/子目录B/最终输出文件_v99_final.mp4", "parts": 1, "part": 0},
+                {"id": 9103, "title": "🎉🔥 表情包开头与阿拉伯语/泰语混排测试：اللغة العربية ภาษาไทย Tiếng Việt — 测试行高与基线裁剪", "state": "fail", "shown": 0.0, "target": 0.0, "error": "HTTPSConnectionPool(host='upos-sz-mirrorcoso1.bilivideo.com', port=443): Read timed out (read timeout=20.0) — 请检查代理或切换直连重试", "parts": 1, "part": 0},
+                {"id": 9104, "title": "正在转封装无损杜比全景声多音轨 MKV 容器测试", "state": "merge", "shown": 100.0, "target": 100.0, "merge_angle": 120.0, "parts": 24, "part": 23},
+                {"id": 9105, "title": "等待队列中的超长画质标签与仅音频混合项测试", "state": "wait", "shown": 0.0, "target": 0.0, "quality_label": "1080P 60帧 高码率", "audio_only": True, "parts": 1, "part": 0},
+            ]
+        elif mode_idx == 3:
+            jobs = []
+        elif mode_idx == 4:
+            jobs = [
+                {"id": 9201, "title": "单条任务边界测试（1 / 1 计数与单行滚动表现）", "state": "done", "shown": 100.0, "target": 100.0, "size": 104857600, "path": "/tmp/single.mp4", "parts": 1, "part": 0}
+            ]
+        else:
+            # 1000 行虚拟化列表滚动压测
+            states = ("done", "run", "wait", "fail", "cancel")
+            jobs = [
+                {"id": 10000 + i, "title": "第 %04d 集 · 大规模 1000 行队列虚拟化流畅度压力测试（行号 #%d）" % (i + 1, i + 1),
+                 "state": states[i % len(states)], "shown": float((i * 17) % 100), "target": float((i * 17) % 100),
+                 "speed": 4194304 if states[i % len(states)] == "run" else 0,
+                 "done_b": 20971520, "total": 41943040, "size": 41943040,
+                 "error": "模拟网络波动超时" if states[i % len(states)] == "fail" else "",
+                 "quality_label": "1080P", "parts": 1, "part": 0}
+                for i in range(1000)
+            ]
+        self.model.set_all(jobs)
+        self.page_q.setCurrentIndex(1 if jobs else 0)
+        self._apply_queue_filter()
         self._refresh_summary()
 
     # ---------------- 设置持久化 ----------------
@@ -1805,6 +2176,8 @@ class MainWindow(QMainWindow):
         self._cookie = s.get("cookie", "")
         self._proxy = s.get("proxy", "")
         self._nickname = s.get("nickname", "")
+        theme_pref = s.get("theme") or "light"
+        self.apply_theme(theme_pref, save=False)
         q = s.get("quality")
         if q is not None:
             i = self.quality_box.findData(q)
@@ -1826,6 +2199,7 @@ class MainWindow(QMainWindow):
                            "cookie": self._cookie,
                            "proxy": self._proxy,
                            "nickname": self._nickname,
+                           "theme": self._theme_mode,
                            "quality": self.quality_box.currentData(),
                            "geometry": bytes(self.saveGeometry().toBase64()).decode()},
                           fp, ensure_ascii=False)
@@ -1849,15 +2223,12 @@ class MainWindow(QMainWindow):
             return
         for t in (self._login_thread, self._preview_thread):
             if t is not None and t.isRunning():
-                t.wait(3000)
+                if not t.wait(500):
+                    t.setParent(None)
+                    self._old_threads.append(t)
         event.accept()
 
     def _stop_worker(self):
-        """取消下载并等后台线程收尾。返回 True 表示已经干净停下。
-
-        QThread 在运行中被销毁会让 Qt 直接 abort（SIGABRT，崩溃弹窗），
-        所以这里必须等到线程真的结束。
-        """
         self._pending = []
         threads = list(self._old_threads)
         if self.dl_thread is not None:
@@ -1873,10 +2244,6 @@ SELFTEST_RESULT = os.path.join(tempfile.gettempdir(), "bilifetch_selftest.txt")
 
 
 def gui_excepthook(etype, value, tb):
-    """槽里抛了异常时的兜底：弹窗报错，别让程序直接消失。
-
-    PyQt5 的默认行为是 qFatal() -> abort()：一个没接住的异常就会把整个 App 打死。
-    """
     text = "".join(traceback.format_exception(etype, value, tb))
     sys.stderr.write(text)
     try:
@@ -1906,7 +2273,6 @@ def selftest_exit(url, out_dir, wait_ms=4000):
     """打包后的自检：开着界面下到一半就关窗口，看会不会 SIGABRT。"""
     app = _make_app()
     win = MainWindow()
-    # 自检不能碰用户自己的设置
     win._settings_path = lambda: os.path.join(
         tempfile.gettempdir(), "bilifetch_selftest_settings.json")
     win._confirm_exit = False
@@ -1921,7 +2287,7 @@ def selftest_exit(url, out_dir, wait_ms=4000):
     def bye():
         state["downloading"] = bool(win.dl_thread and win.dl_thread.isRunning())
         t = win.dl_thread
-        win.close()                       # 走 closeEvent -> _stop_worker
+        win.close()
         state["running"] = bool(t and t.isRunning())
 
     QTimer.singleShot(wait_ms, bye)
@@ -1984,12 +2350,10 @@ def selftest_collection(url, out_dir):
 
 
 def main():
-    # 打包自检：--selftest <链接> <输出目录> / --selftest-collection <合集链接> <输出目录>
     if len(sys.argv) > 1 and sys.argv[1] == "--selftest":
         out_dir = sys.argv[3] if len(sys.argv) > 3 else os.path.expanduser("~/Downloads")
         sys.exit(selftest(sys.argv[2], out_dir))
     if len(sys.argv) > 1 and sys.argv[1] == "--selftest-login":
-        # 生成二维码存成 png：验证打包后 qrcode / PIL 都在（登录功能能不能用的关键）
         try:
             png, key = login_mod.QrLogin().make_qr_png()
             out = os.path.join(tempfile.gettempdir(), "bilifetch_qr.png")
@@ -2011,16 +2375,18 @@ def main():
     sys.excepthook = gui_excepthook
     win = MainWindow()
     win.show()
-    # 开窗之后再后台预热 requests（首次导入 170ms），用户还在看界面时它就加载好了
+    if "--break-ui" in sys.argv:
+        QTimer.singleShot(50, win.toggle_break_ui_bar)
     QTimer.singleShot(250, lambda: threading.Thread(target=core.warm_up, daemon=True).start())
 
     def shutdown():
-        # ⌘Q 退出不会触发窗口的 closeEvent，这里补上取消 + 等线程收尾
         win._save_settings()
         win._stop_worker()
         for t in (win._login_thread, win._preview_thread):
             if t is not None and t.isRunning():
-                t.wait(3000)
+                if not t.wait(500):
+                    t.setParent(None)
+                    win._old_threads.append(t)
 
     app.aboutToQuit.connect(shutdown)
     sys.exit(app.exec_())
