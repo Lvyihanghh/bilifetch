@@ -62,24 +62,60 @@ CDN_MIRRORS = [
 # 单个分段的大小。CDN 对长时间的单连接会直接 reset，分段要够小。
 CHUNK_SIZE = 4 * 1024 * 1024
 
-# 从访达双击启动的 App，PATH 只有 /usr/bin:/bin:/usr/sbin:/sbin，
-# 不含 Homebrew / MacPorts 的 bin 目录 ⇒ ffmpeg 这类工具要手动翻这些位置。
+# 从访达/桌面快捷方式启动的 App，PATH 往往不含包管理器目录 ⇒ 手动翻常见位置。
 EXTRA_BIN_DIRS = [
     "/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin",
     "/opt/homebrew/sbin", "/usr/local/sbin", "/opt/miniconda3/bin",
+    "/snap/bin", os.path.expanduser("~/.local/bin"),
 ]
 
 
+def _win_extra_dirs():
+    dirs = [r"C:\ffmpeg\bin", r"C:\ProgramData\chocolatey\bin"]
+    local = os.environ.get("LOCALAPPDATA") or ""
+    if local:
+        dirs.append(os.path.join(local, "Microsoft", "WinGet", "Links"))
+        dirs.append(os.path.join(local, "Programs", "ffmpeg", "bin"))
+    prof = os.environ.get("USERPROFILE") or ""
+    if prof:
+        dirs.append(os.path.join(prof, "scoop", "shims"))
+    return dirs
+
+
 def find_executable(name):
-    """在 PATH 和常见安装目录里找可执行文件，返回绝对路径；找不到返回 None。"""
+    """在程序同级目录、PATH 和各平台常见安装目录里找可执行文件，返回绝对路径；找不到返回 None。"""
+    exe_names = [name + ".exe", name] if sys.platform == "win32" and not name.endswith(".exe") else [name]
+    # 1. 优先找打包目录或脚本同级目录（Windows 便携包自带 ffmpeg.exe 时直接命中）
+    local_dirs = [
+        os.path.dirname(os.path.abspath(sys.executable)),
+        os.path.dirname(os.path.abspath(__file__)),
+    ]
+    if getattr(sys, "_MEIPASS", None):
+        local_dirs.insert(0, sys._MEIPASS)
+    for d in local_dirs:
+        for n in exe_names:
+            cand = os.path.join(d, n)
+            if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                return cand
+    # 2. 系统 PATH
     found = shutil.which(name)
     if found:
         return found
-    for d in EXTRA_BIN_DIRS:
-        cand = os.path.join(d, name)
-        if os.path.isfile(cand) and os.access(cand, os.X_OK):
-            return cand
+    # 3. 平台常见安装目录
+    search_dirs = _win_extra_dirs() if sys.platform == "win32" else EXTRA_BIN_DIRS
+    for d in search_dirs:
+        for n in exe_names:
+            cand = os.path.join(d, n)
+            if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                return cand
     return None
+
+
+def _subprocess_flags():
+    """Windows GUI 模式下隐藏子进程弹出的黑色 cmd 窗口。"""
+    if sys.platform == "win32":
+        return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+    return {}
 
 # WBI 混淆表（照搬上游 API.MixinArray）
 MIXIN_KEY_ENC_TAB = [
@@ -99,9 +135,12 @@ def log(msg):
 
 
 def sanitize(name, maxlen=80):
-    """把标题里的非法文件名字符换掉，并截断长度。"""
-    name = re.sub(r'[\\/:*?"<>|\r\n\t]', "_", name).strip().strip(".")
-    return (name[:maxlen] or "untitled")
+    """把标题里的非法文件名字符换掉，并截断长度（兼容 Windows 保留设备名）。"""
+    name = re.sub(r'[\\/:*?"<>|\r\n\t]', "_", name).strip().strip(". ")
+    out = name[:maxlen] or "untitled"
+    if re.match(r"^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\.|$)", out, re.I):
+        out = "_" + out
+    return out
 
 
 _requests = None
@@ -676,7 +715,7 @@ def merge(video_file, audio_file, out_file, ffmpeg="ffmpeg"):
     """ffmpeg 合并音视频（流拷贝，不重编码）。"""
     cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
            "-i", video_file, "-i", audio_file, "-c", "copy", "-movflags", "+faststart", out_file]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True, **_subprocess_flags())
     if proc.returncode != 0:
         raise RuntimeError("ffmpeg 合并失败：\n%s" % proc.stderr[-800:])
 
@@ -747,7 +786,7 @@ def download_episode(client, bvid, cid, name, out_dir, quality=0, threads=16, cd
         if on_stage:
             on_stage("转封装")
         subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-                        "-i", afile, "-c", "copy", out], check=True)
+                        "-i", afile, "-c", "copy", out], check=True, **_subprocess_flags())
         os.remove(afile)
         try:
             os.rmdir(tmpdir)       # 临时目录空了就删掉，别在下载目录里留个 .tmp
@@ -828,7 +867,7 @@ def download_episode(client, bvid, cid, name, out_dir, quality=0, threads=16, cd
             on_stage("转封装")
         say("该视频没有独立音频流，直接转封装")
         subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-                        "-i", vfile, "-c", "copy", out], check=True)
+                        "-i", vfile, "-c", "copy", out], check=True, **_subprocess_flags())
         os.remove(vfile)
     try:
         os.rmdir(tmpdir)

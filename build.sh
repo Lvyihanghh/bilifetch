@@ -214,9 +214,129 @@ echo "    $DEB ($(du -h "$DEB" | cut -f1))"
 echo "==> 校验 .deb"
 python3 packaging/verify_deb.py "$DEB"
 
+echo "==> 打包通用 Linux 发行版归档 (.tar.gz)"
+LINUXTAR_DIR="$STAGE/BiliFetch-$VERSION-Linux"
+mkdir -p "$LINUXTAR_DIR/bin" "$LINUXTAR_DIR/lib/bilifetch" "$LINUXTAR_DIR/share"
+copyfile bilifetch.py "$LINUXTAR_DIR/lib/bilifetch/bilifetch.py"
+copyfile bilifetch_gui.py "$LINUXTAR_DIR/lib/bilifetch/bilifetch_gui.py"
+copyfile bilifetch_collection.py "$LINUXTAR_DIR/lib/bilifetch/bilifetch_collection.py"
+copyfile bilifetch_collection_gui.py "$LINUXTAR_DIR/lib/bilifetch/bilifetch_collection_gui.py"
+copyfile bilifetch_login.py "$LINUXTAR_DIR/lib/bilifetch/bilifetch_login.py"
+copyfile bilifetch_login_gui.py "$LINUXTAR_DIR/lib/bilifetch/bilifetch_login_gui.py"
+copyfile bilifetch_ui.py "$LINUXTAR_DIR/lib/bilifetch/bilifetch_ui.py"
+copyfile packaging/launcher.sh "$LINUXTAR_DIR/bin/bilifetch"
+cat > "$LINUXTAR_DIR/bin/bilifetch-gui" <<'LGUI'
+#!/bin/sh
+SELF=$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")
+DIR=$(cd "$(dirname "$SELF")" && pwd)
+exec python3 "$DIR/../lib/bilifetch/bilifetch_gui.py" "$@"
+LGUI
+cat > "$LINUXTAR_DIR/install.sh" <<'LINST'
+#!/bin/sh
+set -e
+DIR=$(cd "$(dirname "$0")" && pwd)
+PREFIX="${PREFIX:-/usr/local}"
+mkdir -p "$PREFIX/bin" "$PREFIX/lib/bilifetch" "$PREFIX/share/applications" "$PREFIX/share/icons/hicolor/512x512/apps"
+install -m 755 "$DIR/bin/bilifetch" "$PREFIX/bin/bilifetch"
+install -m 755 "$DIR/bin/bilifetch-gui" "$PREFIX/bin/bilifetch-gui"
+install -m 644 "$DIR/lib/bilifetch/"*.py "$PREFIX/lib/bilifetch/"
+if [ -f "$DIR/share/bilifetch.png" ]; then
+    install -m 644 "$DIR/share/bilifetch.png" "$PREFIX/share/icons/hicolor/512x512/apps/bilifetch.png"
+fi
+cat > "$PREFIX/share/applications/bilifetch.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=BiliFetch
+Name[zh_CN]=BiliFetch 视频下载器
+Comment=Download videos from Bilibili
+Comment[zh_CN]=B 站视频下载器
+Exec=$PREFIX/bin/bilifetch-gui
+Icon=bilifetch
+Terminal=false
+Categories=Network;Video;Utility;
+EOF
+echo "BiliFetch 已安装到 $PREFIX （运行 bilifetch-gui 打开图形界面，或运行 bilifetch 使用命令行）"
+LINST
+chmod 755 "$LINUXTAR_DIR/bin/bilifetch" "$LINUXTAR_DIR/bin/bilifetch-gui" "$LINUXTAR_DIR/install.sh"
+if [ -f "$STAGE/linuxicon/icon_1024.png" ]; then
+    cp "$STAGE/linuxicon/icon_1024.png" "$LINUXTAR_DIR/share/bilifetch.png"
+    cp "$STAGE/linuxicon/icon_1024.png" "$LINUXTAR_DIR/lib/bilifetch/icon_1024.png"
+fi
+copyfile README.md "$LINUXTAR_DIR/README.md"
+LINUX_TAR="$DIST/BiliFetch-$VERSION-Linux.tar.gz"
+tar -C "$STAGE" -czf "$STAGE/linux.tar.gz" "BiliFetch-$VERSION-Linux"
+cp -X "$STAGE/linux.tar.gz" "$LINUX_TAR"
+echo "    $LINUX_TAR ($(du -h "$LINUX_TAR" | cut -f1))"
+
+# ---------------------------------------------------------------- Windows
+echo "==> 打包 Windows 发行包 (.zip)"
+WIN_DIR="$STAGE/BiliFetch-$VERSION-Windows"
+mkdir -p "$WIN_DIR"
+for f in bilifetch.py bilifetch_gui.py bilifetch_collection.py bilifetch_collection_gui.py \
+         bilifetch_login.py bilifetch_login_gui.py bilifetch_ui.py README.md LICENSE; do
+    copyfile "$f" "$WIN_DIR/$f"
+done
+copyfile bilifetch_gui.py "$WIN_DIR/BiliFetch.pyw"
+if [ -f "$STAGE/linuxicon/icon.ico" ]; then
+    cp "$STAGE/linuxicon/icon.ico" "$WIN_DIR/icon.ico"
+elif [ -f "$STAGE/icon.ico" ]; then
+    cp "$STAGE/icon.ico" "$WIN_DIR/icon.ico"
+fi
+cat > "$WIN_DIR/启动BiliFetch图形界面.vbs" <<'WVBS'
+Set fso = CreateObject("Scripting.FileSystemObject")
+Set shell = CreateObject("WScript.Shell")
+dir = fso.GetParentFolderName(WScript.ScriptFullName)
+shell.CurrentDirectory = dir
+On Error Resume Next
+shell.Run "pythonw.exe """ & dir & "\BiliFetch.pyw""", 0, False
+If Err.Number <> 0 Then
+    Err.Clear
+    shell.Run "pyw.exe """ & dir & "\BiliFetch.pyw""", 0, False
+End If
+WVBS
+cat > "$WIN_DIR/bilifetch.bat" <<'WBAT'
+@echo off
+chcp 65001 >nul
+python "%~dp0bilifetch.py" %*
+WBAT
+cat > "$WIN_DIR/一键安装依赖与桌面快捷方式.bat" <<'WINST'
+@echo off
+chcp 65001 >nul
+echo [1/2] 正在安装 Python 依赖 (PyQt5, requests, qrcode, pillow)...
+python -m pip install --upgrade PyQt5 requests qrcode pillow
+echo [2/2] 正在创建桌面快捷方式...
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$s=(New-Object -COM WScript.Shell).CreateShortcut([Environment]::GetFolderPath('Desktop')+'\BiliFetch.lnk'); ^
+   $s.TargetPath='wscript.exe'; ^
+   $s.Arguments='\"%~dp0启动BiliFetch图形界面.vbs\"'; ^
+   $s.WorkingDirectory='%~dp0'; ^
+   if (Test-Path '%~dp0icon.ico') { $s.IconLocation='%~dp0icon.ico' }; ^
+   $s.Save()"
+echo.
+echo 安装完成！双击桌面上的 BiliFetch 图标即可打开图形界面。
+echo 如需安装 ffmpeg，可在终端运行：winget install Gyan.FFmpeg
+pause
+WINST
+cat > "$WIN_DIR/打包独立exe.bat" <<'WEXE'
+@echo off
+chcp 65001 >nul
+echo 正在使用 PyInstaller 打包独立免安装 BiliFetch.exe ...
+python -m pip install --upgrade PyQt5 requests qrcode pillow pyinstaller
+python -m PyInstaller --noconfirm --onefile --windowed --name BiliFetch ^
+  --icon "%~dp0icon.ico" --add-data "%~dp0icon.ico;." ^
+  --exclude-module numpy --exclude-module cryptography --exclude-module matplotlib ^
+  "%~dp0bilifetch_gui.py"
+echo 打包完成，产物在 dist\BiliFetch.exe
+pause
+WEXE
+WIN_ZIP="$DIST/BiliFetch-$VERSION-Windows.zip"
+( cd "$STAGE" && zip -qr "$STAGE/windows.zip" "BiliFetch-$VERSION-Windows" )
+cp -X "$STAGE/windows.zip" "$WIN_ZIP"
+echo "    $WIN_ZIP ($(du -h "$WIN_ZIP" | cut -f1))"
+
 # ---------------------------------------------------------------- 校验和
 echo "==> 生成校验和"
-( cd "$DIST" && shasum -a 256 ./*.dmg ./*.pkg ./*.deb > SHA256SUMS )
+( cd "$DIST" && shasum -a 256 ./*.dmg ./*.pkg ./*.deb ./*.tar.gz ./*.zip > SHA256SUMS )
 cat "$DIST/SHA256SUMS"
 
 # ---------------------------------------------------------------- 收尾

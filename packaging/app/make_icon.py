@@ -77,6 +77,8 @@ def build(outdir, scheme="brand"):
     os.makedirs(outdir, exist_ok=True)
     path = os.path.join(outdir, "icon_1024.png")
     canvas.save(path)
+    ico_path = os.path.join(outdir, "icon.ico")
+    canvas.save(ico_path, format="ICO", sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
     return path
 
 

@@ -95,9 +95,19 @@ def classify_link(text):
 
 
 def load_app_icon():
-    """窗口图标：优先用打包好的 .icns；源码运行时现画一只矢量狐狸。"""
-    for c in (os.path.join(os.path.dirname(sys.executable), "..", "Resources", "icon.icns"),
-              os.path.join(HERE, "packaging", "app", "icon_1024.png")):
+    """窗口图标：优先用打包好的 .icns / .ico / .png；源码运行时现画一只矢量狐狸。"""
+    exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+    candidates = [
+        os.path.join(exe_dir, "..", "Resources", "icon.icns"),
+        os.path.join(exe_dir, "icon.ico"),
+        os.path.join(exe_dir, "icon_1024.png"),
+        os.path.join(HERE, "packaging", "app", "icon.ico"),
+        os.path.join(HERE, "packaging", "app", "icon_1024.png"),
+    ]
+    if getattr(sys, "_MEIPASS", None):
+        candidates.insert(0, os.path.join(sys._MEIPASS, "icon.ico"))
+        candidates.insert(0, os.path.join(sys._MEIPASS, "icon_1024.png"))
+    for c in candidates:
         c = os.path.normpath(c)
         if os.path.exists(c):
             return QIcon(c)
@@ -124,8 +134,16 @@ def human_speed(bps):
     return "%.0f KB/s" % (bps / 1024.0)
 
 
+def reveal_label():
+    if sys.platform == "darwin":
+        return "在访达中显示"
+    if sys.platform == "win32":
+        return "在资源管理器中显示"
+    return "在文件管理器中显示"
+
+
 def reveal_in_file_manager(path):
-    """在访达 / 文件管理器里显示文件。"""
+    """在访达 / 资源管理器 / 文件管理器里显示并选中文件。"""
     if not path:
         return
     if sys.platform == "darwin":
@@ -136,7 +154,11 @@ def reveal_in_file_manager(path):
     elif sys.platform.startswith("linux"):
         subprocess.Popen(["xdg-open", path if os.path.isdir(path) else os.path.dirname(path)])
     else:
-        os.startfile(path if os.path.isdir(path) else os.path.dirname(path))
+        norm = os.path.normpath(path)
+        if os.path.isfile(norm):
+            subprocess.Popen(["explorer.exe", "/select," + norm])
+        else:
+            os.startfile(norm if os.path.isdir(norm) else os.path.dirname(norm))
 
 
 def open_path(path):
@@ -268,7 +290,13 @@ class DownloadThread(QThread):
         self.job_started.emit(jid)
         tag = job["title"][:24]
         if not ffmpeg:
-            self.job_failed.emit(jid, "找不到 ffmpeg，请先安装（macOS: brew install ffmpeg）")
+            if sys.platform == "darwin":
+                hint = "找不到 ffmpeg，请先安装（brew install ffmpeg）"
+            elif sys.platform == "win32":
+                hint = "找不到 ffmpeg，请运行 winget install Gyan.FFmpeg 或将 ffmpeg.exe 放到本程序目录"
+            else:
+                hint = "找不到 ffmpeg，请先安装（sudo apt install ffmpeg）"
+            self.job_failed.emit(jid, hint)
             return
         try:
             parts = self._expand(job)
@@ -2034,7 +2062,7 @@ class MainWindow(QMainWindow):
         if job:
             st = job["state"]
             if st == "done" and job.get("path"):
-                menu.addAction("在访达中显示", lambda: reveal_in_file_manager(job["path"]))
+                menu.addAction(reveal_label(), lambda: reveal_in_file_manager(job["path"]))
                 if os.path.isfile(job["path"]):
                     menu.addAction("打开", lambda: open_path(job["path"]))
             if st in ("fail", "cancel"):
@@ -2153,6 +2181,8 @@ class MainWindow(QMainWindow):
         base = os.path.expanduser("~")
         if sys.platform == "darwin":
             base = os.path.join(base, "Library", "Application Support")
+        elif sys.platform == "win32":
+            base = os.environ.get("APPDATA") or os.path.join(base, "AppData", "Roaming")
         else:
             base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(base, ".config")
         d = os.path.join(base, "BiliFetch")
@@ -2263,6 +2293,10 @@ def _make_app():
     f = app.font()
     if sys.platform == "darwin":
         f.setFamily(".AppleSystemUIFont")
+    elif sys.platform == "win32":
+        f.setFamilies(["Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI"])
+    else:
+        f.setFamilies(["Noto Sans CJK SC", "Ubuntu", "Cantarell", "DejaVu Sans", "sans-serif"])
     f.setPixelSize(13)
     app.setFont(f)
     app.setStyleSheet(QSS)

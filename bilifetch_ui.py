@@ -193,7 +193,7 @@ STATE_COLORS = dict(THEMES["light"]["state_colors"])
 
 
 def detect_system_dark():
-    """检测操作系统当前是否处于深色模式。"""
+    """检测操作系统当前是否处于深色模式（支持 macOS / Windows / Linux）。"""
     if sys.platform == "darwin":
         try:
             out = subprocess.check_output(
@@ -201,6 +201,30 @@ def detect_system_dark():
                 stderr=subprocess.DEVNULL, timeout=0.3
             ).decode("utf-8", "ignore").strip().lower()
             return out == "dark"
+        except Exception:
+            return False
+    if sys.platform == "win32":
+        try:
+            import winreg
+            key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+            )
+            val, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+            winreg.CloseKey(key)
+            return int(val) == 0
+        except Exception:
+            return False
+    if sys.platform.startswith("linux"):
+        gtk = (os.environ.get("GTK_THEME") or "").lower()
+        if "dark" in gtk:
+            return True
+        try:
+            out = subprocess.check_output(
+                ["gsettings", "get", "org.gnome.desktop.interface", "color-scheme"],
+                stderr=subprocess.DEVNULL, timeout=0.3
+            ).decode("utf-8", "ignore").strip().lower()
+            return "dark" in out
         except Exception:
             return False
     return False
@@ -320,8 +344,10 @@ def tabular_font(px=12, weight=QFont.Normal):
     f = QFont()
     if sys.platform == "darwin":
         f.setFamilies(["Helvetica Neue", "PingFang SC", ".AppleSystemUIFont"])
+    elif sys.platform == "win32":
+        f.setFamilies(["Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", "Arial"])
     else:
-        f.setFamilies(["Inter", "Liberation Sans", "DejaVu Sans", "Arial", "sans-serif"])
+        f.setFamilies(["Inter", "Ubuntu", "Noto Sans CJK SC", "Liberation Sans", "DejaVu Sans", "Arial"])
     f.setPixelSize(px)
     f.setWeight(weight)
     return f
