@@ -236,7 +236,8 @@ class ItemModel(QAbstractListModel):
     @staticmethod
     def _meta_text(item):
         bits = []
-        if item.get("no"):
+        title = (item.get("title") or "").strip()
+        if item.get("no") and not title.startswith("第"):
             bits.append("第%s集" % item["no"])
         if item.get("duration"):
             bits.append(col.format_duration(item.get("duration")))

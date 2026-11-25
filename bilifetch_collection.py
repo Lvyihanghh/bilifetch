@@ -140,7 +140,10 @@ def _fetch_fav(client, mid, sid):
         if not medias:
             break
         for m in medias:
-            items.append({"bvid": m.get("bvid"), "title": m.get("title") or "",
+            title = (m.get("title") or "").strip()
+            if m.get("attr") or title == "已失效视频":
+                continue
+            items.append({"bvid": m.get("bvid"), "title": title,
                           "duration": int(m.get("duration") or 0),
                           "pic": m.get("cover") or "", "view": 0, "checked": True})
         total = (d.get("page") or {}).get("total") or len(items)
@@ -179,11 +182,19 @@ def _fetch_bangumi(client, sid=None, ep_id=None):
             return 999
     main_eps = sorted(best.values(), key=ep_no)
 
+    season_title = r.get("season_title") or "番剧"
     items = []
     for ep in main_eps:
+        raw_no = str(ep.get("title") or "").strip()
+        long_t = (ep.get("long_title") or "").strip()
+        if raw_no.isdigit():
+            prefix = "第%02d集" % int(raw_no)
+            disp_title = ("%s %s" % (prefix, long_t)).strip() if long_t else ("%s %s" % (season_title, prefix)).strip()
+        else:
+            disp_title = ("%s %s" % (raw_no, long_t)).strip() or season_title
         items.append({
             "bvid": ep.get("bvid"),
-            "title": ep.get("long_title") or ep.get("title") or "",
+            "title": disp_title,
             "duration": int(ep.get("duration") or 0) // 1000,   # 毫秒 -> 秒
             "pic": ep.get("cover") or "",
             "view": 0,
@@ -191,7 +202,7 @@ def _fetch_bangumi(client, sid=None, ep_id=None):
             "group": "正片",
             "current": str(ep.get("id")) == str(ep_id),
             "checked": (str(ep.get("id")) == str(ep_id)) if ep_id else True,
-            "no": ep.get("title") or "",
+            "no": raw_no,
         })
     # 花絮 / 二创分区，默认不勾也不显示
     for sec in (r.get("section") or []):
@@ -265,10 +276,9 @@ def fetch_collection(client, url):
 
 
 def fetch_preview(client, url):
-    """统一预览入口：合集/列表/收藏夹 -> 清单；单个视频 -> 它的分 P 清单。
-
-    返回和 fetch_collection 一样的结构，图形界面用同一个对话框展示。
-    """
+    """统一预览入口：先展开 b23.tv 短链，再路由合集/列表/收藏夹或单个视频分 P 清单。"""
+    if hasattr(client, "expand_short_url"):
+        url = client.expand_short_url(url)
     if detect_collection(url):
         return fetch_collection(client, url)
 

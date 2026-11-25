@@ -1,0 +1,3 @@
+# Custom-painted Qt delegates, cached card surfaces, and three-layer theme tokens
+
+The PyQt5 GUI renders list rows (`QueueView` and `ItemView`) exclusively through `QListView` and `QStyledItemDelegate` (`QPainter`) instead of creating per-row `QWidget` trees (`setItemWidget`), caches card drop-shadows as device-pixel-ratio pixmaps, drives all in-flight row animations from a single shared 16ms timer that sleeps when idle, and applies `setStyleSheet` only once at startup or theme switch using a three-layer token table (`PRIMITIVES` -> `THEMES` -> semantic helpers). This keeps scrolling and progress updates at a steady 60fps even on 1,000-row queues or 100-episode collections.

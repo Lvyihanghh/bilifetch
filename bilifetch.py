@@ -176,7 +176,12 @@ class BiliClient:
     """Bilibili API 客户端。"""
 
     def __init__(self, cookie="", proxy=None):
-        self.session = req().Session()
+        requests = req()
+        self.session = requests.Session()
+        # 挂载大容量连接池（32 域名 × 64 并发 keep-alive 连接），彻底消除 32 线程抢默认 10 连接导致的频繁断连与重握手
+        adapter = requests.adapters.HTTPAdapter(pool_connections=32, pool_maxsize=64, max_retries=0)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
         # 默认不读系统代理：ClashX 之类的 TUN 代理会重置 CDN 连接
         self.session.trust_env = False
         if proxy:
@@ -188,9 +193,6 @@ class BiliClient:
             "Accept-Language": "zh-CN,zh;q=0.9",
         })
         if cookie:
-            # 放进 cookie jar（domain=.bilibili.com）：
-            # 一是 requests 不会用 jar 里的 cookie 覆盖我们设的 header，
-            # 二是 CDN（*.bilivideo.com）拿不到 B 站 cookie，不至于泄漏出去。
             for part in cookie.split(";"):
                 if "=" in part:
                     k, v = part.strip().split("=", 1)
@@ -199,6 +201,7 @@ class BiliClient:
                                                 domain=".bilibili.com", path="/")
         self._wbi_img = None
         self._pgc_cache = {}
+        self._aborted = False
         # 正在读数据的响应：取消时直接掐断它们
         self._active = set()
         self._active_lock = threading.Lock()
@@ -207,19 +210,11 @@ class BiliClient:
 
     # ---------- 取消 ----------
     def cancel(self):
-        """立刻打断正在进行的网络读取。
-
-        光置取消标志不够：请求正卡在 socket 读取上时，要等到读超时（最长 60 秒）
-        才会去看标志 —— 表现就是"点了停止半天停不下来"。
-        这里直接把连接关掉，阻塞的读会立刻抛错，然后重试逻辑就会看到取消标志。
-
-        关连接的动作放到后台线程：close() 可能和正在读的线程抢锁，
-        放在界面线程里做会把界面卡住。
-        """
+        """立刻打断正在进行的网络读取（放到后台线程异步掐断 socket，界面 0ms 返回）。"""
+        self._aborted = True
         with self._active_lock:
             resp_list = list(self._active)
-        if not resp_list:
-            return
+            self._active.clear()
         threading.Thread(target=self._close_all, args=(resp_list,),
                          name="cancel-conns", daemon=True).start()
 
@@ -227,11 +222,22 @@ class BiliClient:
     def _close_all(resp_list):
         for r in resp_list:
             try:
+                raw = getattr(r, "raw", None)
+                if raw is not None:
+                    fp = getattr(raw, "_fp", None)
+                    if fp is not None and hasattr(fp, "close"):
+                        fp.close()
                 r.close()
             except Exception:
                 pass
 
     def _track(self, resp):
+        if self._aborted:
+            try:
+                resp.close()
+            except Exception:
+                pass
+            raise Cancelled()
         with self._active_lock:
             self._active.add(resp)
         return resp
@@ -240,17 +246,54 @@ class BiliClient:
         with self._active_lock:
             self._active.discard(resp)
 
+    def _sleep_check(self, seconds, should_stop=None):
+        """可被随时打断的退避等待（每 40ms 检查一次取消标志）。"""
+        steps = max(1, int(seconds / 0.04))
+        for _ in range(steps):
+            if self._aborted or (should_stop and should_stop()):
+                raise Cancelled()
+            time.sleep(0.04)
+
     # ---------- 基础请求 ----------
 
     def get_json(self, url, params=None, referer=None):
-        """请求 API，返回解析后的 json；失败抛 RuntimeError。"""
+        """请求 API，返回解析后的 json；遇到偶发网络抖动自动重试 3 次。"""
         headers = {"Referer": referer} if referer else None
-        resp = self.session.get(url, params=params, headers=headers, timeout=(10, 30))
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("code") != 0:
-            raise RuntimeError("接口报错 code=%s message=%s" % (data.get("code"), data.get("message")))
-        return data
+        last_err = None
+        for attempt in range(3):
+            if self._aborted:
+                raise Cancelled()
+            try:
+                resp = self.session.get(url, params=params, headers=headers, timeout=(6, 15))
+                resp.raise_for_status()
+                data = resp.json()
+                if data.get("code") != 0:
+                    raise RuntimeError("接口报错 code=%s message=%s" % (data.get("code"), data.get("message")))
+                return data
+            except Cancelled:
+                raise
+            except RuntimeError:
+                raise
+            except Exception as e:
+                last_err = e
+                if attempt < 2:
+                    self._sleep_check(0.3 * (attempt + 1))
+        raise RuntimeError("网络请求失败（已重试 3 次）：%s" % last_err)
+
+    def expand_short_url(self, text):
+        """如果是 b23.tv 短链，先跟随 302 还原成真实长链接（带重试）。"""
+        text = (text or "").strip()
+        if "b23.tv" not in text:
+            return text
+        target = text if text.startswith("http") else "https://" + text
+        for attempt in range(3):
+            try:
+                resp = self.session.get(target, allow_redirects=True, timeout=(6, 12))
+                return resp.url or text
+            except Exception:
+                if attempt < 2:
+                    self._sleep_check(0.25 * (attempt + 1))
+        return text
 
     # ---------- WBI 签名（照搬上游 API.encWbi）----------
 
@@ -291,12 +334,7 @@ class BiliClient:
 
     def resolve(self, text):
         """把用户输入解析成 {'bvid','cid','title','episodes','is_pgc'}。"""
-        text = text.strip()
-        # 短链先跟随跳转
-        if "b23.tv" in text:
-            resp = self.session.get(text if text.startswith("http") else "https://" + text,
-                                    allow_redirects=True, timeout=(10, 30))
-            text = resp.url
+        text = self.expand_short_url(text)
 
         if re.fullmatch(r"av\d+", text, re.I):
             return self._from_av(text.lower())
@@ -414,28 +452,13 @@ class BiliClient:
 
     def download(self, urls, dest, referer="https://www.bilibili.com/", threads=16, cdn="",
                  on_progress=None, should_stop=None):
-        """多线程分段下载。
-
-        两点实测结论：
-        1) CDN 对长时间的单连接会直接 reset，分段（Range）请求才稳；
-        2) 不同镜像速度能差 40 倍，下载前先探速挑最快的。
-        """
+        """多线程分段下载（带多 CDN 镜像探速排序与分段级无缝故障切换）。"""
         if isinstance(urls, str):
             urls = [urls]
         urls = self._expand_candidates(urls, cdn)
-        best = self._fastest_cdn(urls, referer, should_stop=should_stop)
-        order = ([best] if best else []) + [u for u in urls if u != best]
-        last_err = None
-        for url in order:
-            try:
-                self._download_split(url, dest, referer, threads, on_progress, should_stop)
-                return
-            except Cancelled:
-                raise
-            except Exception as e:
-                last_err = e
-                log("    换下一个地址：%s" % str(e)[:60])
-        raise RuntimeError("所有下载地址都失败了：%s" % last_err)
+        ranked = self._rank_cdns(urls, referer, should_stop=should_stop)
+        order = ranked if ranked else urls
+        self._download_split(order, dest, referer, threads, on_progress, should_stop)
 
     def _expand_candidates(self, urls, cdn=""):
         """把原始地址展开成「原地址 + 各镜像」候选列表。"""
@@ -447,7 +470,6 @@ class BiliClient:
                 cands.append(urlunparse(p._replace(netloc=host)))
             if not cdn:
                 cands.append(u)
-        # 去重并保持顺序
         seen, out = set(), []
         for u in cands:
             if u not in seen:
@@ -455,39 +477,34 @@ class BiliClient:
                 out.append(u)
         return out
 
-    def _fastest_cdn(self, urls, referer, should_stop=None):
-        """挑最快的镜像。
-
-        这里以前是**串行**探的，坑很大：
-        候选镜像有 18 个（9 个域名 × 主/备地址），里面不少是坏的或者极慢的。
-        串行探、每个最多等 11 秒（连接 5 + 读取 6），
-        实测下载开始前要白等 **11.6 秒**，而且这段时间里点「停止」几乎没反应
-        （请求正卡在等响应头，取消标志根本没机会被看到）。
-
-        改成**并行探**：所有候选一起测，取最快的。整体耗时 ≈ 单个候选的耗时。
-        另外三点讲究：
-        1) 计时从**收到响应头之后**开始 —— 连接和 TLS 握手那几百毫秒不该算进去，
-           否则快的镜像会被误判成慢的（实测镜像之间能差 40 倍，选错就全程慢）。
-        2) 探速用很短的超时（探速只是要个相对快慢，不用等满）。
-        3) **同一个客户端里探过的镜像不再重复探** —— 视频流探完，音频流直接复用，
-           省掉一半的连接风暴（一集番剧原本会同时开 36 个探测连接）。
-        """
+    def _rank_cdns(self, urls, referer, should_stop=None):
+        """并行探测候选镜像，按实测传输速度从高到低排序返回可用镜像列表。"""
         if not urls:
-            return None
+            return []
 
         cache = self._probe_cache
 
         def probe(u):
+            if self._aborted or (should_stop and should_stop()):
+                return None
             host = urlparse(u).netloc
             if host in cache:
-                return (cache[host], u)
+                sp = cache[host]
+                return (sp, u) if sp > 0 else None
             try:
-                resp = self.session.get(u, headers=self._range_headers(referer, 0, 256 * 1024),
-                                        stream=True, timeout=(2.5, 2.5))
+                resp = self.session.get(u, headers=self._range_headers(referer, 0, 192 * 1024),
+                                        stream=True, timeout=(2.0, 2.0))
                 self._track(resp)
                 try:
-                    t = time.time()          # 响应头到了才开始算传输速度
-                    n = sum(len(c) for c in resp.iter_content(1 << 16))
+                    if resp.status_code not in (200, 206):
+                        cache[host] = -1.0
+                        return None
+                    t = time.time()
+                    n = 0
+                    for c in resp.iter_content(1 << 15):
+                        if self._aborted or (should_stop and should_stop()):
+                            return None
+                        n += len(c)
                 finally:
                     self._untrack(resp)
                     resp.close()
@@ -500,66 +517,96 @@ class BiliClient:
                 return None
 
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        best, best_speed = None, 0.0
-        pool = ThreadPoolExecutor(max_workers=min(12, len(urls)))
+        scored = []
+        pool = ThreadPoolExecutor(max_workers=min(10, len(urls)))
         try:
             futures = [pool.submit(probe, u) for u in urls]
             for fut in as_completed(futures):
-                if should_stop and should_stop():
+                if self._aborted or (should_stop and should_stop()):
                     raise Cancelled()
                 res = fut.result()
-                if res and res[0] > best_speed:
-                    best_speed, best = res[0], res[1]
-                if best_speed > 5e6:       # 5 MB/s 单连接就够快，不用等其它镜像
-                    break
+                if res:
+                    scored.append(res)
+                    if res[0] > 6e6 and len(scored) >= 2:
+                        break
         finally:
             try:
                 pool.shutdown(wait=False, cancel_futures=True)
             except TypeError:
                 pool.shutdown(wait=False)
-        if best:
-            log("    CDN 镜像：%s  探速 %.2f MB/s" % (urlparse(best).netloc, best_speed / 1e6))
-        return best
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        fast_urls = [u for _sp, u in scored]
+        if fast_urls:
+            log("    CDN 镜像：%s  探速 %.2f MB/s（共 %d 个可用节点）" %
+                (urlparse(fast_urls[0]).netloc, scored[0][0] / 1e6, len(fast_urls)))
+        rest = [u for u in urls if u not in fast_urls and cache.get(urlparse(u).netloc, 0) >= 0]
+        return fast_urls + rest
 
     def _range_headers(self, referer, start, end):
         return {"Referer": referer, "Accept-Encoding": "identity",
                 "Range": "bytes=%d-%d" % (start, end)}
 
-    def _total_size(self, url, referer):
-        """用一个 1 字节的 Range 请求探出文件总大小。"""
-        resp = self.session.get(url, headers=self._range_headers(referer, 0, 0),
-                                stream=True, timeout=(6, 10))
-        self._track(resp)
-        try:
-            cr = resp.headers.get("Content-Range") or ""
-        finally:
-            self._untrack(resp)
-            resp.close()
-        if "/" not in cr:
-            raise RuntimeError("服务端没有返回文件大小")
-        return int(cr.rsplit("/", 1)[1])
-
-    def _fetch_chunk(self, url, path, start, end, referer, prog, should_stop=None):
-        """下载一个分段，中断后从断点续传本段。"""
-        written = 0
-        for attempt in range(5):
-            if should_stop and should_stop():
+    def _total_size(self, urls, referer, should_stop=None):
+        """用一个 1 字节的 Range 请求探出文件总大小，失败时自动轮换备用镜像。"""
+        if isinstance(urls, str):
+            urls = [urls]
+        last_err = None
+        for u in urls[:6]:
+            if self._aborted or (should_stop and should_stop()):
                 raise Cancelled()
             try:
-                resp = self.session.get(url, headers=self._range_headers(referer, start + written, end),
-                                        stream=True, timeout=(5, 4))
+                resp = self.session.get(u, headers=self._range_headers(referer, 0, 0),
+                                        stream=True, timeout=(4, 6))
+                self._track(resp)
+                try:
+                    cr = resp.headers.get("Content-Range") or ""
+                finally:
+                    self._untrack(resp)
+                    resp.close()
+                if "/" in cr:
+                    return int(cr.rsplit("/", 1)[1]), u
+            except Cancelled:
+                raise
+            except Exception as e:
+                last_err = e
+        raise RuntimeError("无法获取文件大小：%s" % (last_err or "服务端未返回 Content-Range"))
+
+    def _fetch_chunk(self, urls, path, start, end, referer, prog, should_stop=None, file_lock=None):
+        """下载一个 4MiB 分段，若当前镜像中断或限速，下一次重试立即无缝切换到备用 CDN 镜像并从已写偏移续传。"""
+        if isinstance(urls, str):
+            urls = [urls]
+        written = 0
+        max_attempts = max(6, min(10, len(urls) * 2))
+        for attempt in range(max_attempts):
+            if self._aborted or (should_stop and should_stop()):
+                raise Cancelled()
+            u = urls[attempt % len(urls)]
+            try:
+                resp = self.session.get(u, headers=self._range_headers(referer, start + written, end),
+                                        stream=True, timeout=(3.5, 4.0))
                 self._track(resp)
                 try:
                     if resp.status_code not in (200, 206):
                         raise RuntimeError("HTTP %s" % resp.status_code)
-                    with open(path, "r+b") as fp:
-                        fp.seek(start + written)
-                        for chunk in resp.iter_content(1 << 16):
-                            if should_stop and should_stop():
-                                raise Cancelled()
-                            fp.write(chunk)
-                            written += len(chunk)
-                            prog.add(len(chunk))
+                    for chunk in resp.iter_content(1 << 16):
+                        if self._aborted or (should_stop and should_stop()):
+                            raise Cancelled()
+                        if not chunk:
+                            continue
+                        if file_lock is not None:
+                            with file_lock:
+                                if self._aborted or (should_stop and should_stop()):
+                                    raise Cancelled()
+                                with open(path, "r+b") as fp:
+                                    fp.seek(start + written)
+                                    fp.write(chunk)
+                        else:
+                            with open(path, "r+b") as fp:
+                                fp.seek(start + written)
+                                fp.write(chunk)
+                        written += len(chunk)
+                        prog.add(len(chunk))
                 finally:
                     self._untrack(resp)
                     resp.close()
@@ -568,21 +615,22 @@ class BiliClient:
             except Cancelled:
                 raise
             except Exception as e:
-                if should_stop and should_stop():
-                    raise Cancelled()      # 取消优先，别再睡一觉
-                if attempt == 4:
-                    raise
-                log("    分段 %d-%d 中断（%s），重试" % (start, end, str(e)[:40]))
-                time.sleep(1 + attempt)
+                if self._aborted or (should_stop and should_stop()):
+                    raise Cancelled()
+                if attempt == max_attempts - 1:
+                    raise RuntimeError("分段 %d-%d 重试 %d 次仍失败：%s" % (start, end, max_attempts, e))
+                self._sleep_check(min(0.8, 0.15 * (attempt + 1)), should_stop)
         raise RuntimeError("分段 %d-%d 下载不完整" % (start, end))
 
-    def _download_split(self, url, dest, referer, threads, on_progress=None, should_stop=None):
+    def _download_split(self, urls, dest, referer, threads, on_progress=None, should_stop=None):
+        if isinstance(urls, str):
+            urls = [urls]
         tmp = dest + ".part"
         state_file = dest + ".part.state"
-        total = self._total_size(url, referer)
+        total, primary_url = self._total_size(urls, referer, should_stop=should_stop)
+        ordered_urls = [primary_url] + [u for u in urls if u != primary_url]
         n_chunks = (total + CHUNK_SIZE - 1) // CHUNK_SIZE
 
-        # 断点信息：已完成的分段编号
         done_chunks = set()
         if os.path.exists(state_file):
             try:
@@ -605,20 +653,42 @@ class BiliClient:
                                            if i in done_chunks),
                         callback=on_progress)
         state_lock = threading.Lock()
+        file_lock = threading.Lock()
 
         def task(item):
             i, start, end = item
             if i in done_chunks:
                 return
-            self._fetch_chunk(url, tmp, start, end, referer, prog, should_stop)
+            self._fetch_chunk(ordered_urls, tmp, start, end, referer, prog, should_stop, file_lock=file_lock)
             with state_lock:
+                if self._aborted or (should_stop and should_stop()):
+                    raise Cancelled()
                 done_chunks.add(i)
                 with open(state_file, "w") as fp:
                     json.dump(sorted(done_chunks), fp)
 
-        with ThreadPoolExecutor(max(1, min(threads, 32))) as ex:
-            list(ex.map(task, ranges))
+        from concurrent.futures import as_completed
+        pending_ranges = [r for r in ranges if r[0] not in done_chunks]
+        if pending_ranges:
+            ex = ThreadPoolExecutor(max(1, min(threads, 32)))
+            try:
+                futs = [ex.submit(task, r) for r in pending_ranges]
+                for fut in as_completed(futs):
+                    if self._aborted or (should_stop and should_stop()):
+                        self.cancel()
+                        raise Cancelled()
+                    fut.result()
+            except BaseException:
+                try:
+                    ex.shutdown(wait=False, cancel_futures=True)
+                except TypeError:
+                    ex.shutdown(wait=False)
+                raise
+            else:
+                ex.shutdown(wait=True)
 
+        if self._aborted or (should_stop and should_stop()):
+            raise Cancelled()
         prog.finish()
         os.replace(tmp, dest)
         if os.path.exists(state_file):
@@ -727,14 +797,8 @@ def merge(video_file, audio_file, out_file, ffmpeg="ffmpeg"):
 
 def download_episode(client, bvid, cid, name, out_dir, quality=0, threads=16, cdn="",
                      audio_only=False, force=False, ffmpeg=None, on_log=None,
-                     on_progress=None, on_stage=None, should_stop=None):
-    """下载单集：取流 -> 下载音视频 -> ffmpeg 合并。返回输出文件路径。
-
-    命令行和图形界面都走这个函数，保证两条路的行为一致。
-    on_log(text)        打印一行日志
-    on_progress(done, total)  下载字节进度
-    on_stage(text)      阶段切换（"视频流" / "音频流" / "合并"）
-    """
+                     on_progress=None, on_stage=None, on_quality=None, should_stop=None):
+    """下载单集：取流 -> 下载音视频 -> ffmpeg 合并。返回输出文件路径。"""
     say = on_log or (lambda t: log(t))
     ffmpeg = ffmpeg or find_executable("ffmpeg")
     if not ffmpeg:
@@ -742,6 +806,9 @@ def download_episode(client, bvid, cid, name, out_dir, quality=0, threads=16, cd
 
     data = client.playurl(bvid, cid, quality)
     got_quality = data.get("quality")
+    q_label = "仅音频" if audio_only else QN_NAME.get(got_quality, ("%sP" % got_quality) if got_quality else "")
+    if on_quality and q_label:
+        on_quality(q_label)
     accept = data.get("accept_quality") or []
     say("画质：%s (id=%s)  可选：%s" %
         (QN_NAME.get(got_quality, str(got_quality)), got_quality,
@@ -850,9 +917,12 @@ def download_episode(client, bvid, cid, name, out_dir, quality=0, threads=16, cd
         t_a = threading.Thread(target=_run, args=(_dl_a, box_a), name="dl-audio", daemon=True)
         t_v.start()
         t_a.start()
-        t_v.join()
-        t_a.join()
-        # 取消优先抛（先取消再报网络错误没意义）
+        while t_v.is_alive() or t_a.is_alive():
+            if (should_stop and should_stop()) or client._aborted:
+                client.cancel()
+                raise Cancelled()
+            t_v.join(0.05)
+            t_a.join(0.05)
         for e in box_v + box_a:
             if isinstance(e, Cancelled):
                 raise e
@@ -860,6 +930,8 @@ def download_episode(client, bvid, cid, name, out_dir, quality=0, threads=16, cd
             raise box_v[0]
         if box_a:
             raise box_a[0]
+        if (should_stop and should_stop()) or client._aborted:
+            raise Cancelled()
         if on_stage:
             on_stage("合并")
         say("合并 -> %s" % os.path.basename(out))
@@ -966,15 +1038,15 @@ def main():
 
     # ---------- 解析链接 ----------
     log("解析链接：%s" % args.url)
-    # 合集 / 列表 / 收藏夹：先列出来（图形界面里可以逐个勾选）
+    resolved_url = client.expand_short_url(args.url)
     try:
         import bilifetch_collection as collection_mod
     except ImportError:
         collection_mod = None
-    if collection_mod and collection_mod.detect_collection(args.url):
-        info = collection_mod.fetch_collection(client, args.url)
+    if collection_mod and collection_mod.detect_collection(resolved_url):
+        info = collection_mod.fetch_collection(client, resolved_url)
         if not info or not info.get("items"):
-            log("这个%s里没有可下载的视频" % info.get("kind_label", "合集"))
+            log("这个%s里没有可下载的视频" % (info or {}).get("kind_label", "合集"))
             return 1
         main_items = [it for it in info["items"] if not it.get("extra")]
         extra = [it for it in info["items"] if it.get("extra")]
@@ -986,19 +1058,38 @@ def main():
                      collection_mod.format_views(it["view"]) + " 播放"))
         if extra:
             log("   另有 %d 个花絮/二创分区（图形界面里可展开）" % len(extra))
-        log("")
-        log("这是%s，命令行只能整份下载。" % info["kind_label"])
-        log("想挑着下，请用图形界面：BiliFetch.app（macOS）或 bilifetch-gui（Linux）。")
-        return 0
-    info = client.resolve(args.url)
-    log("  标题：%s" % info["title"])
-    log("  UP主：%s   时长：%d 秒" % (info["owner"], info["duration"]))
-
-    # ---------- 决定要下哪几集 ----------
-    try:
-        jobs = plan_jobs(client, info, all_episodes=args.all_episodes, page=args.page)
-    except ValueError as e:
-        raise SystemExit(str(e))
+        if args.list_q or args.dry_run:
+            return 0
+        if args.page and args.page > 0:
+            if args.page > len(main_items):
+                raise SystemExit("--page %d 超出范围（共 %d 集）" % (args.page, len(main_items)))
+            chosen = [main_items[args.page - 1]]
+        else:
+            chosen = main_items
+        jobs = []
+        for it in chosen:
+            cid = it.get("cid")
+            if not cid:
+                pages = client.pagelist(it["bvid"])
+                if not pages:
+                    continue
+                if len(pages) == 1:
+                    jobs.append((it["title"], it["bvid"], pages[0]["cid"]))
+                else:
+                    for k, p in enumerate(pages):
+                        part = p.get("part") or ("P%d" % p.get("page"))
+                        jobs.append((it["title"] if k == 0 else ("%s - %s" % (it["title"], part)),
+                                     it["bvid"], p["cid"]))
+            else:
+                jobs.append((it["title"], it["bvid"], cid))
+    else:
+        info = client.resolve(resolved_url)
+        log("  标题：%s" % info["title"])
+        log("  UP主：%s   时长：%d 秒" % (info["owner"], info["duration"]))
+        try:
+            jobs = plan_jobs(client, info, all_episodes=args.all_episodes, page=args.page)
+        except ValueError as e:
+            raise SystemExit(str(e))
 
     log("  待下载：%d 集" % len(jobs))
 

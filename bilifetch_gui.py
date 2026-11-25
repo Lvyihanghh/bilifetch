@@ -179,6 +179,7 @@ class DownloadThread(QThread):
     job_title = pyqtSignal(int, str)
     job_part = pyqtSignal(int, int, int)            # id, 第几个分P(0起), 共几个
     job_stage = pyqtSignal(int, str)
+    job_quality = pyqtSignal(int, str)              # id, 实际落盘画质名称
     job_progress = pyqtSignal(int, float, float)    # id, 已下字节, 总字节
     job_done = pyqtSignal(int, str)
     job_failed = pyqtSignal(int, str)
@@ -325,6 +326,7 @@ class DownloadThread(QThread):
                     on_log=lambda t: self.log_line.emit("[%s] %s" % (tag, t)),
                     on_progress=lambda d, t: self.job_progress.emit(jid, d, t),
                     on_stage=lambda s: self.job_stage.emit(jid, s),
+                    on_quality=lambda q: self.job_quality.emit(jid, q),
                     should_stop=self._should_stop)
             except core.Cancelled:
                 self.log_line.emit("[%s] 已取消" % tag)
@@ -568,10 +570,12 @@ class QueueDelegate(QStyledItemDelegate):
         st = job["state"]
         if st == "done" and job.get("path"):
             return ("reveal", "folder", "定位")
+        if st == "pause":
+            return ("retry", "play", "继续")
         if st in ("fail", "cancel"):
             return ("retry", "retry", "重试")
         if st in ("wait", "run"):
-            return ("cancel", "close", "取消")
+            return ("cancel", "pause", "暂停")
         return None
 
     def action_rect(self, option_rect):
@@ -589,6 +593,8 @@ class QueueDelegate(QStyledItemDelegate):
             return human_speed(job.get("speed", 0)) if job.get("speed") else (job.get("stage") or "准备中")
         if st == "merge":
             return "合并中"
+        if st == "pause":
+            return "已暂停"
         if st == "done":
             return "已完成"
         if st == "fail":
@@ -598,13 +604,16 @@ class QueueDelegate(QStyledItemDelegate):
     def meta_text(self, job):
         bits = []
         st = job["state"]
+        rq = job.get("resolved_quality")
         if job.get("parts", 1) > 1:
             bits.append("P%d/%d" % (job.get("part", 0) + 1, job["parts"]))
-        if st == "run" and job.get("total"):
+        if rq and st in ("run", "pause", "done"):
+            bits.append(rq)
+        if st in ("run", "pause") and job.get("total"):
             bits.append("%s / %s" % (human_size(job.get("done_b", 0)), human_size(job["total"])))
             sp = job.get("speed") or 0
             remain = job["total"] - job.get("done_b", 0)
-            if sp > 1024 and remain > 0:
+            if st == "run" and sp > 1024 and remain > 0:
                 sec = int(remain / sp)
                 bits.append("剩余 %d:%02d" % (sec // 60, sec % 60) if sec < 3600
                             else "剩余 %d:%02d:%02d" % (sec // 3600, sec % 3600 // 60, sec % 60))
@@ -616,9 +625,10 @@ class QueueDelegate(QStyledItemDelegate):
             if job.get("path"):
                 bits.append(os.path.basename(job["path"]) if os.path.isfile(job["path"])
                             else job["path"])
-        elif st == "wait":
-            bits.append(job.get("quality_label", ""))
-        if job.get("audio_only"):
+        elif st in ("wait", "pause"):
+            if not rq:
+                bits.append(job.get("quality_label", ""))
+        if job.get("audio_only") and rq != "仅音频":
             bits.append("仅音频")
         return "  ·  ".join(b for b in bits if b)
 
@@ -661,11 +671,11 @@ class QueueDelegate(QStyledItemDelegate):
         # 左侧状态圆
         c = QRectF(r.left() + 12, r.center().y() - 16, 32, 32)
         pct = job.get("shown", 0.0)
-        if st in ("run", "merge"):
+        if st in ("run", "merge") or (st == "pause" and pct > 0.5):
             p.setPen(QPen(QColor(t["track"]), 3))
             p.setBrush(Qt.NoBrush)
             p.drawEllipse(c.adjusted(2, 2, -2, -2))
-            pen = QPen(QColor(t["orange"] if st == "merge" else t["blue"]), 3)
+            pen = QPen(QColor(t["orange"] if st in ("merge", "pause") else t["blue"]), 3)
             pen.setCapStyle(Qt.RoundCap)
             p.setPen(pen)
             if st == "merge":
@@ -674,9 +684,13 @@ class QueueDelegate(QStyledItemDelegate):
             else:
                 span = max(4.0, pct * 3.6)
                 p.drawArc(c.adjusted(2, 2, -2, -2), 90 * 16, int(-span * 16))
-            p.setPen(QColor(t["ink_2"]))
-            p.setFont(self.f_num)
-            p.drawText(c, Qt.AlignCenter, "%d" % int(pct) if st == "run" else "···")
+            if st == "pause":
+                p.drawPixmap(int(c.center().x() - 6), int(c.center().y() - 6),
+                             make_icon("pause", t["orange"], 12))
+            else:
+                p.setPen(QColor(t["ink_2"]))
+                p.setFont(self.f_num)
+                p.drawText(c, Qt.AlignCenter, "%d" % int(pct) if st == "run" else "···")
         else:
             p.save()
             done_t = job.get("done_t")
@@ -692,7 +706,7 @@ class QueueDelegate(QStyledItemDelegate):
             p.setPen(Qt.NoPen)
             p.setBrush(QColor(soft))
             p.drawEllipse(c)
-            icon = {"done": "check", "fail": "close", "cancel": "stop"}.get(st)
+            icon = {"done": "check", "fail": "close", "cancel": "stop", "pause": "pause"}.get(st)
             if icon:
                 p.drawPixmap(int(c.center().x() - 8), int(c.center().y() - 8),
                              make_icon(icon, fg, 16))
@@ -744,16 +758,16 @@ class QueueDelegate(QStyledItemDelegate):
         meta = self.meta_text(job)
         meta_right_pad = (self.ACTION_W + 24) if spec is not None else 14
         meta_w = max(40.0, r.right() - x - meta_right_pad)
-        if st in ("run", "merge"):
+        if st in ("run", "merge") or (st == "pause" and pct > 0.5):
             bar = QRectF(x, top + 26, meta_w, 4)
             p.setPen(Qt.NoPen)
             p.setBrush(QColor(t["track"]))
             p.drawRoundedRect(bar, 2, 2)
             w = bar.width() * (1.0 if st == "merge" else pct / 100.0)
             if w > 1:
-                p.setBrush(QColor(t["orange"] if st == "merge" else t["blue"]))
+                p.setBrush(QColor(t["orange"] if st in ("merge", "pause") else t["blue"]))
                 p.drawRoundedRect(QRectF(bar.left(), bar.top(), w, bar.height()), 2, 2)
-            p.setFont(self.f_meta_tab if st == "run" else self.f_meta)
+            p.setFont(self.f_meta_tab if st in ("run", "pause") else self.f_meta)
             p.setPen(QColor(t["ink_3"]))
             fm_m = QFontMetrics(p.font())
             p.drawText(QRectF(x, top + 33, meta_w, 16),
@@ -1343,17 +1357,22 @@ class MainWindow(QMainWindow):
         self.summary = QLabel("")
         self.summary.setObjectName("muted")
         self.summary.setFont(tabular_font(12))
+        self.summary.setContentsMargins(6, 0, 4, 0)
         qhead.addWidget(self.summary)
         qhead.addStretch(1)
         self.btn_clear = Button("清除已完成", "ghost", "trash", height=32)
         self.btn_clear.clicked.connect(self.on_clear)
-        self.btn_stop = Button("全部停止", "secondary", "stop", height=32)
+        self.btn_start_all = Button("全部开始", "primary", "play", height=32)
+        self.btn_start_all.setToolTip("继续所有已暂停或失败的下载任务")
+        self.btn_start_all.clicked.connect(self.on_start_all)
+        self.btn_stop = Button("全部暂停", "secondary", "pause", height=32)
+        self.btn_stop.setToolTip("立即暂停所有正在进行的下载任务（保留已下载分片）")
         self.btn_stop.clicked.connect(self.on_stop)
         self.btn_copy = Button("复制", "ghost", "copy", height=32)
         self.btn_copy.clicked.connect(self.on_copy_log)
         self.btn_logclear = Button("清空", "ghost", "trash", height=32)
         self.btn_logclear.clicked.connect(self.on_clear_log)
-        for b in (self.btn_clear, self.btn_stop, self.btn_copy, self.btn_logclear):
+        for b in (self.btn_clear, self.btn_start_all, self.btn_stop, self.btn_copy, self.btn_logclear):
             qhead.addWidget(b)
         qcard.layout.addLayout(qhead)
 
@@ -1490,6 +1509,7 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentIndex(i)
         q = i == 0
         self.btn_clear.setVisible(q)
+        self.btn_start_all.setVisible(q)
         self.btn_stop.setVisible(q)
         self.summary.setVisible(q)
         self.filter_seg.setVisible(q and len(self.model.jobs) > 0)
@@ -1723,7 +1743,7 @@ class MainWindow(QMainWindow):
     # ---------------- 下载队列与筛选 ----------------
     def _apply_queue_filter(self):
         f_idx = self.filter_seg.index()
-        # 0 = 全部, 1 = 进行中, 2 = 已完成, 3 = 失败/取消
+        # 0 = 全部, 1 = 进行中(含已暂停), 2 = 已完成, 3 = 失败/取消
         v = self.list
         v.setUpdatesEnabled(False)
         vis_count = 0
@@ -1731,7 +1751,7 @@ class MainWindow(QMainWindow):
             for i, job in enumerate(self.model.jobs):
                 st = job["state"]
                 if f_idx == 1:
-                    hide = st not in ("wait", "run", "merge")
+                    hide = st not in ("wait", "run", "merge", "pause")
                 elif f_idx == 2:
                     hide = st != "done"
                 elif f_idx == 3:
@@ -1752,11 +1772,32 @@ class MainWindow(QMainWindow):
         out_dir = self._ensure_out_dir()
         quality = self.quality_box.currentData()
         qlabel = self.quality_box.currentText()
+        used_names = {
+            core.sanitize(j["title"]).lower()
+            for j in self.model.jobs
+            if j.get("out_dir") == out_dir and j.get("title")
+        }
         jobs = []
         for it in (items or [{"url": url, "title": url}]):
+            raw_title = it.get("title") or it.get("bvid") or url
+            key = core.sanitize(raw_title).lower()
+            if key in used_names:
+                bvid = it.get("bvid")
+                cand = "%s (%s)" % (raw_title, bvid) if bvid else None
+                if cand and core.sanitize(cand).lower() not in used_names:
+                    raw_title = cand
+                else:
+                    seq = 2
+                    while True:
+                        cand = "%s (#%d)" % (raw_title, seq)
+                        if core.sanitize(cand).lower() not in used_names:
+                            raw_title = cand
+                            break
+                        seq += 1
+            used_names.add(core.sanitize(raw_title).lower())
             job = {
                 "id": self._next_id,
-                "title": it.get("title") or it.get("bvid") or url,
+                "title": raw_title,
                 "bvid": it.get("bvid"), "cid": it.get("cid"), "url": it.get("url"),
                 "out_dir": out_dir, "quality": quality, "quality_label": qlabel,
                 "audio_only": audio_only,
@@ -1792,6 +1833,7 @@ class MainWindow(QMainWindow):
         t.log_line.connect(self.append_log)
         t.job_started.connect(self._on_job_started)
         t.job_title.connect(self._on_job_title)
+        t.job_quality.connect(self._on_job_quality)
         t.job_part.connect(self._on_job_part)
         t.job_stage.connect(self._on_job_stage)
         t.job_progress.connect(self._on_job_progress)
@@ -1809,7 +1851,7 @@ class MainWindow(QMainWindow):
         if t is self.dl_thread:
             self.dl_thread = None
         t.deleteLater()
-        if self._pending:
+        if self.dl_thread is None and self._pending:
             jobs, self._pending = self._pending, []
             self._spawn(jobs)
         elif self.dl_thread is None:
@@ -1821,10 +1863,16 @@ class MainWindow(QMainWindow):
 
     # ---- 线程信号 ----
     def _on_job_started(self, jid):
+        if self.sender() is not None and self.sender() is not self.dl_thread:
+            return
         job = self.model.get(jid)
         if job:
-            job.update(state="run", stage="准备中", shown=0.0, target=0.0, speed=0,
-                       done_b=0, total=0)
+            resuming = job.pop("resuming", False)
+            shown = job.get("shown", 0.0) if resuming else 0.0
+            target = job.get("target", 0.0) if resuming else 0.0
+            job.update(state="run", stage="准备中", shown=shown, target=target, speed=0,
+                       done_b=job.get("done_b", 0) if resuming else 0,
+                       total=job.get("total", 0) if resuming else 0)
             self._samples.pop(jid, None)
             self.model.touch(jid)
             self._apply_queue_filter()
@@ -1839,7 +1887,15 @@ class MainWindow(QMainWindow):
             job["title"] = title
             self.model.touch(jid)
 
+    def _on_job_quality(self, jid, qlabel):
+        job = self.model.get(jid)
+        if job and qlabel:
+            job["resolved_quality"] = qlabel
+            self.model.touch(jid)
+
     def _on_job_part(self, jid, k, n):
+        if self.sender() is not None and self.sender() is not self.dl_thread:
+            return
         job = self.model.get(jid)
         if job:
             job.update(part=k, parts=n, state="run")
@@ -1847,6 +1903,8 @@ class MainWindow(QMainWindow):
             self.model.touch(jid)
 
     def _on_job_stage(self, jid, stage):
+        if self.sender() is not None and self.sender() is not self.dl_thread:
+            return
         job = self.model.get(jid)
         if not job:
             return
@@ -1860,6 +1918,8 @@ class MainWindow(QMainWindow):
         self.model.touch(jid)
 
     def _on_job_progress(self, jid, done, total):
+        if self.sender() is not None and self.sender() is not self.dl_thread:
+            return
         job = self.model.get(jid)
         if not job or not total:
             return
@@ -1893,6 +1953,8 @@ class MainWindow(QMainWindow):
         self._maybe_all_done()
 
     def _on_job_failed(self, jid, msg):
+        if self.sender() is not None and self.sender() is not self.dl_thread:
+            return
         job = self.model.get(jid)
         if job:
             job.update(state="fail", error=msg.splitlines()[0][:200] if msg else "下载失败",
@@ -1903,9 +1965,11 @@ class MainWindow(QMainWindow):
         self._maybe_all_done()
 
     def _on_job_cancelled(self, jid):
+        if self.sender() is not None and self.sender() is not self.dl_thread:
+            return
         job = self.model.get(jid)
-        if job:
-            job.update(state="cancel", speed=0)
+        if job and job["state"] not in ("wait", "run", "done"):
+            job.update(state="pause", speed=0)
             self.model.touch(jid)
             self._apply_queue_filter()
         self._refresh_summary()
@@ -1988,12 +2052,14 @@ class MainWindow(QMainWindow):
             self.summary.setText("")
             self.seg.setBadge(0, "")
             self.setWindowTitle("BiliFetch")
+            self.btn_start_all.setEnabled(False)
             self.btn_stop.setEnabled(False)
             self.btn_clear.setEnabled(False)
             return
         n = len(jobs)
         done = sum(1 for j in jobs if j["state"] == "done")
         fail = sum(1 for j in jobs if j["state"] == "fail")
+        paused = sum(1 for j in jobs if j["state"] in ("pause", "cancel"))
         active = sum(1 for j in jobs if j["state"] in ("wait", "run", "merge"))
         self.seg.setBadge(0, str(active if active else n))
         if active:
@@ -2005,30 +2071,48 @@ class MainWindow(QMainWindow):
             self.setWindowTitle("BiliFetch (%d/%d)" % (done, n))
         else:
             txt = "已完成 %d 个" % done
+            if paused:
+                txt += "，已暂停 %d 个" % paused
             if fail:
                 txt += "，失败 %d 个" % fail
             self.setWindowTitle("BiliFetch")
         if self.summary.text() != txt:
             self.summary.setText(txt)
+        self.btn_start_all.setEnabled(any(j["state"] in ("pause", "cancel", "fail") for j in jobs))
         self.btn_stop.setEnabled(bool(active))
-        self.btn_clear.setEnabled(any(j["state"] in ("done", "cancel") for j in jobs))
+        self.btn_clear.setEnabled(any(j["state"] in ("done", "cancel", "pause") for j in jobs))
 
-    # ---- 队列操作 ----
+    # ---- 队列操作（0ms 瞬时状态机与后台线程解耦）----
     def on_stop(self):
+        paused_count = 0
         for job in self.model.jobs:
-            if job["state"] == "wait":
-                job["state"] = "cancel"
-        self._pending = [j for j in self._pending if j["state"] != "cancel"]
+            if job["state"] in ("wait", "run", "merge"):
+                job["state"] = "pause"
+                job["speed"] = 0
+                paused_count += 1
+        self._pending = []
         if self.dl_thread is not None:
-            self.dl_thread.cancel_all()
-            if self.dl_thread not in self._old_threads:
-                self._old_threads.append(self.dl_thread)
+            t = self.dl_thread
+            self.dl_thread = None
+            t.cancel_all()
+            if t not in self._old_threads:
+                self._old_threads.append(t)
+        self._speed_timer.stop()
         self._apply_queue_filter()
         self.list.viewport().update()
         self._refresh_summary()
+        if paused_count:
+            self.toast.show_message("已全部暂停（点击「全部开始」可立即续传）", kind="info")
+
+    def on_start_all(self):
+        resumable = [j for j in self.model.jobs if j["state"] in ("pause", "cancel", "fail")]
+        if not resumable:
+            return
+        self._retry(resumable)
+        self.toast.show_message("已开始 %d 个任务" % len(resumable), kind="ok")
 
     def on_clear(self):
-        self.model.remove_where(lambda j: j["state"] in ("done", "cancel"))
+        self.model.remove_where(lambda j: j["state"] in ("done", "cancel", "pause"))
         self._apply_queue_filter()
         if not self.model.jobs:
             self.page_q.setCurrentIndex(0)
@@ -2052,7 +2136,7 @@ class MainWindow(QMainWindow):
         job = ix.data(QueueModel.JobRole)
         if job and job["state"] == "done" and job.get("path"):
             reveal_in_file_manager(job["path"])
-        elif job and job["state"] in ("fail", "cancel"):
+        elif job and job["state"] in ("fail", "cancel", "pause"):
             self._retry([job])
 
     def _on_context_menu(self, pos):
@@ -2065,40 +2149,62 @@ class MainWindow(QMainWindow):
                 menu.addAction(reveal_label(), lambda: reveal_in_file_manager(job["path"]))
                 if os.path.isfile(job["path"]):
                     menu.addAction("打开", lambda: open_path(job["path"]))
-            if st in ("fail", "cancel"):
+            if st in ("pause", "cancel"):
+                menu.addAction("继续下载", lambda: self._retry([job]))
+            if st == "fail":
                 menu.addAction("重试", lambda: self._retry([job]))
             if st in ("wait", "run", "merge"):
-                menu.addAction("取消", lambda: self._cancel_job(job))
+                menu.addAction("暂停", lambda: self._cancel_job(job))
             if st not in ("run", "merge"):
                 menu.addAction("从列表移除", lambda: self._remove_job(job))
             if st == "fail" and job.get("error"):
                 menu.addAction("复制错误信息",
                                lambda: QApplication.clipboard().setText(job["error"]))
             menu.addSeparator()
-        fails = [j for j in self.model.jobs if j["state"] in ("fail", "cancel")]
-        if fails:
-            menu.addAction("重试全部失败 / 取消的（%d）" % len(fails), lambda: self._retry(fails))
-        if any(j["state"] in ("done", "cancel") for j in self.model.jobs):
+        resumable = [j for j in self.model.jobs if j["state"] in ("pause", "fail", "cancel")]
+        if resumable:
+            menu.addAction("全部开始 / 重试（%d）" % len(resumable), self.on_start_all)
+        if any(j["state"] in ("wait", "run", "merge") for j in self.model.jobs):
+            menu.addAction("全部暂停", self.on_stop)
+        if any(j["state"] in ("done", "cancel", "pause") for j in self.model.jobs):
             menu.addAction("清除已完成", self.on_clear)
         if not menu.isEmpty():
             menu.exec_(self.list.viewport().mapToGlobal(pos))
 
     def _retry(self, jobs):
         for job in jobs:
-            job.update(state="wait", shown=0.0, target=0.0, error="", speed=0, part=0)
+            was_paused = (job["state"] == "pause" and job.get("shown", 0.0) > 0)
+            if was_paused:
+                job.update(state="wait", error="", speed=0, resuming=True)
+            else:
+                job.update(state="wait", shown=0.0, target=0.0, error="", speed=0,
+                           part=0, resuming=False)
             self.model.touch(job["id"])
         self._apply_queue_filter()
+        self.list.viewport().update()
         self._submit(list(jobs))
         self._refresh_summary()
 
     def _cancel_job(self, job):
-        if job["state"] == "wait":
-            job["state"] = "cancel"
-            self.model.touch(job["id"])
-            self._pending = [j for j in self._pending if j["id"] != job["id"]]
+        jid = job["id"]
+        job["state"] = "pause"
+        job["speed"] = 0
+        self.model.touch(jid)
+        self._pending = [j for j in self._pending if j["id"] != jid]
         if self.dl_thread is not None:
-            self.dl_thread.cancel_job(job["id"])
+            if self.dl_thread._current == jid:
+                t = self.dl_thread
+                self.dl_thread = None
+                t.cancel_job(jid)
+                if t not in self._old_threads:
+                    self._old_threads.append(t)
+                waiting = [j for j in self.model.jobs if j["state"] == "wait"]
+                if waiting:
+                    self._spawn(waiting)
+            else:
+                self.dl_thread.cancel_job(jid)
         self._apply_queue_filter()
+        self.list.viewport().update()
         self._refresh_summary()
 
     def _remove_job(self, job):
@@ -2136,22 +2242,22 @@ class MainWindow(QMainWindow):
             return
         if mode_idx == 1:
             jobs = [
-                {"id": 9001, "title": "第01话 末世桃源", "state": "done", "shown": 100.0, "target": 100.0, "size": 536870912, "path": "/tmp/第01话 末世桃源.mp4", "parts": 1, "part": 0},
-                {"id": 9002, "title": "第02话 波澜初起", "state": "done", "shown": 100.0, "target": 100.0, "size": 536870912, "path": "/tmp/第02话 波澜初起.mp4", "parts": 1, "part": 0},
-                {"id": 9003, "title": "第03话 长夜（4K 修复版）", "state": "run", "shown": 63.0, "target": 63.0, "speed": 8808038, "done_b": 327155712, "total": 522190848, "parts": 3, "part": 1},
-                {"id": 9004, "title": "第04话 雷云", "state": "merge", "shown": 100.0, "target": 100.0, "merge_angle": 45.0, "parts": 1, "part": 0},
-                {"id": 9005, "title": "第05话 天光", "state": "wait", "shown": 0.0, "target": 0.0, "quality_label": "最高画质", "parts": 1, "part": 0},
-                {"id": 9006, "title": "第06话 余烬", "state": "fail", "shown": 0.0, "target": 0.0, "error": "HTTP 403: 没有权限（可能需要大会员）", "parts": 1, "part": 0},
+                {"id": 9001, "title": "第01集 末世桃源", "state": "done", "shown": 100.0, "target": 100.0, "size": 536870912, "path": "/tmp/第01集 末世桃源.mp4", "resolved_quality": "4K 超清", "parts": 1, "part": 0},
+                {"id": 9002, "title": "第02集 波澜初起", "state": "done", "shown": 100.0, "target": 100.0, "size": 536870912, "path": "/tmp/第02集 波澜初起.mp4", "resolved_quality": "4K 超清", "parts": 1, "part": 0},
+                {"id": 9003, "title": "第03集 长夜（4K 修复版）", "state": "run", "shown": 63.0, "target": 63.0, "speed": 8808038, "done_b": 327155712, "total": 522190848, "resolved_quality": "4K 超清", "parts": 3, "part": 1},
+                {"id": 9004, "title": "第04集 雷云", "state": "merge", "shown": 100.0, "target": 100.0, "merge_angle": 45.0, "resolved_quality": "1080P 高码率", "parts": 1, "part": 0},
+                {"id": 9005, "title": "第05集 天光", "state": "pause", "shown": 42.0, "target": 42.0, "done_b": 176160768, "total": 419430400, "resolved_quality": "1080P 高清", "parts": 1, "part": 0},
+                {"id": 9006, "title": "第06集 余烬", "state": "fail", "shown": 0.0, "target": 0.0, "error": "HTTP 403: 没有权限（可能需要大会员）", "parts": 1, "part": 0},
             ]
         elif mode_idx == 2:
             # break-ui 极端但真实的数据集（超长多语言标题、Emoji 前缀、无空格长 URL 错误、极端大文件与分P）
             self._set_login_state("🦊 Aleksandra Wiśniewska-Kowalczyk · 超级无敌长昵称测试账号")
             jobs = [
-                {"id": 9101, "title": "【4K HDR 120FPS 杜比视界】《灵笼 第二季 · 终章》全集高码率收藏版 — Supercalifragilisticexpialidocious_2026_Remastered_Edition_Final_v12", "state": "run", "shown": 98.4, "target": 98.4, "speed": 134217728, "done_b": 19864223744, "total": 20186346291, "parts": 128, "part": 126, "audio_only": True},
+                {"id": 9101, "title": "【4K HDR 120FPS 杜比视界】《灵笼 第二季 · 终章》全集高码率收藏版 — Supercalifragilisticexpialidocious_2026_Remastered_Edition_Final_v12", "state": "run", "shown": 98.4, "target": 98.4, "speed": 134217728, "done_b": 19864223744, "total": 20186346291, "resolved_quality": "4K 超清", "parts": 128, "part": 126, "audio_only": True},
                 {"id": 9102, "title": "A", "state": "done", "shown": 100.0, "target": 100.0, "size": 999, "path": "/Volumes/ExternalDrive/Media/Archive/2026/Bilibili/极其深层的目录结构测试/子目录A/子目录B/最终输出文件_v99_final.mp4", "parts": 1, "part": 0},
                 {"id": 9103, "title": "🎉🔥 表情包开头与阿拉伯语/泰语混排测试：اللغة العربية ภาษาไทย Tiếng Việt — 测试行高与基线裁剪", "state": "fail", "shown": 0.0, "target": 0.0, "error": "HTTPSConnectionPool(host='upos-sz-mirrorcoso1.bilivideo.com', port=443): Read timed out (read timeout=20.0) — 请检查代理或切换直连重试", "parts": 1, "part": 0},
                 {"id": 9104, "title": "正在转封装无损杜比全景声多音轨 MKV 容器测试", "state": "merge", "shown": 100.0, "target": 100.0, "merge_angle": 120.0, "parts": 24, "part": 23},
-                {"id": 9105, "title": "等待队列中的超长画质标签与仅音频混合项测试", "state": "wait", "shown": 0.0, "target": 0.0, "quality_label": "1080P 60帧 高码率", "audio_only": True, "parts": 1, "part": 0},
+                {"id": 9105, "title": "已暂停断点续传任务与超长画质标签仅音频混合项测试", "state": "pause", "shown": 57.6, "target": 57.6, "done_b": 301989888, "total": 524288000, "resolved_quality": "1080P 60帧", "audio_only": True, "parts": 1, "part": 0},
             ]
         elif mode_idx == 3:
             jobs = []
@@ -2161,7 +2267,7 @@ class MainWindow(QMainWindow):
             ]
         else:
             # 1000 行虚拟化列表滚动压测
-            states = ("done", "run", "wait", "fail", "cancel")
+            states = ("done", "run", "pause", "wait", "fail")
             jobs = [
                 {"id": 10000 + i, "title": "第 %04d 集 · 大规模 1000 行队列虚拟化流畅度压力测试（行号 #%d）" % (i + 1, i + 1),
                  "state": states[i % len(states)], "shown": float((i * 17) % 100), "target": float((i * 17) % 100),

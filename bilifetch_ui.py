@@ -117,6 +117,7 @@ THEMES = {
             "wait": (PRIMITIVES["slate_400"], PRIMITIVES["slate_100"]),
             "run": (PRIMITIVES["blue_500"], PRIMITIVES["blue_50"]),
             "merge": (PRIMITIVES["orange_500"], PRIMITIVES["orange_50"]),
+            "pause": (PRIMITIVES["orange_500"], PRIMITIVES["orange_50"]),
             "done": (PRIMITIVES["green_500"], PRIMITIVES["green_50"]),
             "fail": (PRIMITIVES["red_500"], PRIMITIVES["red_50"]),
             "cancel": (PRIMITIVES["slate_400"], PRIMITIVES["slate_100"]),
@@ -158,6 +159,7 @@ THEMES = {
             "wait": (PRIMITIVES["zinc_400"], PRIMITIVES["zinc_800"]),
             "run": ("#20B8F0", PRIMITIVES["blue_950"]),
             "merge": ("#FFAD42", PRIMITIVES["orange_950"]),
+            "pause": ("#FFAD42", PRIMITIVES["orange_950"]),
             "done": ("#36C982", PRIMITIVES["green_950"]),
             "fail": ("#F76C68", PRIMITIVES["red_950"]),
             "cancel": (PRIMITIVES["zinc_400"], PRIMITIVES["zinc_800"]),
@@ -657,6 +659,11 @@ def make_icon(kind, color, size=16, dpr=2.0):
     elif kind == "stop":
         p.setBrush(QColor(color))
         p.drawRoundedRect(QRectF(4.5, 4.5, 7, 7), 1.5, 1.5)
+    elif kind == "pause":
+        p.setBrush(QColor(color))
+        p.setPen(Qt.NoPen)
+        p.drawRoundedRect(QRectF(4.4, 3.8, 2.5, 8.4), 1.1, 1.1)
+        p.drawRoundedRect(QRectF(9.1, 3.8, 2.5, 8.4), 1.1, 1.1)
     elif kind == "play":
         p.setBrush(QColor(color))
         path.moveTo(5.5, 3.8)

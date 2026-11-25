@@ -1,0 +1,3 @@
+# Bangumi episode deduplication by maximum duration and three-tier playurl fallback
+
+Bilibili's `pgc/view/web/season` endpoint returns duplicate entries for the same episode number in `episodes[]`—one 30–100 second preview clip and one full-length Main Episode—so slicing the first `total` items yields preview clips instead of full episodes. BiliFetch groups episodes by episode number (`title`) and selects the entry with the maximum `duration` (converting millisecond durations to seconds), while separating `section[]` entries as unchecked Extra Clips. When resolving DASH streams (`fnval=4048`), BiliFetch queries `pgc/player/web/playurl` first, falls back to `x/player/playurl`, and finally retries with WBI-signed `x/player/wbi/playurl`.
